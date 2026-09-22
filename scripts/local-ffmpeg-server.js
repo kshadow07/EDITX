@@ -1,12 +1,14 @@
 import http from 'http';
-import { spawn, execSync } from 'child_process';
-import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync } from 'fs';
+import { spawn, execSync, spawnSync } from 'child_process';
+import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import formidable from 'formidable';
 import { GoogleGenAI } from '@google/genai';
 import { fal } from '@fal-ai/client';
+import { queryVault as obsidianQueryVault, getItemById as obsidianGetItemById, thumbnailPathFor as obsidianThumbnailPathFor, getObsidianStatus, syncMirror as obsidianSyncMirror } from './obsidian-agent.js';
+import { askJev, jevConfigured, choice as jevChoice, noul as jevNoul } from './jev.js';
 
 // Load environment variables from .dev.vars
 function loadEnvVars() {
@@ -31,6 +33,38 @@ loadEnvVars();
 // Map FAL_API_KEY to FAL_KEY for backward compatibility
 if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
+}
+
+// Calls Claude Sonnet 5 directly over the Messages API. Used for the actual
+// chat/prompt orchestration in DiCaprio (prompt enhancement) and CreatorOS
+// (command planning) — Director's orchestration lives in the Cloudflare
+// Worker (src/worker/index.ts), which has its own copy of this helper.
+// Deeper multimodal helpers elsewhere in this file (video/transcript
+// analysis, animation JSX generation) still use Gemini intentionally.
+async function callClaude(apiKey, system, userMessage, maxTokens = 1024) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Claude API error (${response.status}): ${errText}`);
+  }
+
+  // Sonnet 5 puts extended-thinking blocks first — find the actual text block, not content[0].
+  const data = await response.json();
+  return data.content?.find((block) => block.type === 'text')?.text ?? '';
 }
 
 const PORT = 3333;
@@ -122,10 +156,48 @@ function restoreSessionsFromDisk() {
 
       try {
         const stats = statSync(assetPath);
+
+        // Skip orphan files: zero-byte files (failed uploads) and files
+        // smaller than 1KB. They can't be valid media and would otherwise
+        // appear as ghost assets in the user's library.
+        if (stats.size < 1024) {
+          console.log(`[Session] Skipping orphan/empty asset: ${assetFile.name} (${stats.size} bytes)`);
+          continue;
+        }
+
         const thumbPath = join(assetsDir, `${assetId}_thumb.jpg`);
 
         // Merge with saved metadata if available
         const savedMeta = savedAssetsMeta[assetId] || {};
+
+        // If duration/width/height are missing from metadata (e.g. metadata
+        // save raced with a server restart), probe the file directly with
+        // ffprobe so the asset is restored with accurate dimensions. Without
+        // this, render computes `outPoint = clip.outPoint || asset.duration`
+        // → undefined → `trim=0:NaN` → ffmpeg silently drops the clip from
+        // the export.
+        let duration = savedMeta.duration;
+        let width = savedMeta.width;
+        let height = savedMeta.height;
+        if (type !== 'audio' && (duration === undefined || width === undefined || height === undefined)) {
+          try {
+            const result = execSync(
+              `ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration -show_entries format=duration -of default=noprint_wrappers=1:nokey=0 "${assetPath}"`,
+              { encoding: 'utf-8' }
+            );
+            for (const line of result.split('\n')) {
+              const [k, v] = line.split('=');
+              if (k === 'width' && width === undefined) width = parseInt(v) || undefined;
+              if (k === 'height' && height === undefined) height = parseInt(v) || undefined;
+              if (k === 'duration' && duration === undefined) duration = parseFloat(v) || undefined;
+            }
+            if (duration !== undefined) {
+              console.log(`[Session] Re-probed ${assetFile.name}: ${width}x${height}, ${duration.toFixed(2)}s`);
+            }
+          } catch (probeErr) {
+            console.log(`[Session] Could not probe ${assetFile.name}: ${probeErr.message}`);
+          }
+        }
 
         assets.set(assetId, {
           id: assetId,
@@ -141,16 +213,18 @@ function restoreSessionsFromDisk() {
           sceneCount: savedMeta.sceneCount,
           sceneDataPath: savedMeta.sceneDataPath,
           editCount: savedMeta.editCount || 0,
-          duration: savedMeta.duration,
-          width: savedMeta.width,
-          height: savedMeta.height,
+          sourceAssetId: savedMeta.sourceAssetId,
+          shortMeta: savedMeta.shortMeta,
+          duration,
+          width,
+          height,
         });
 
         if (savedMeta.aiGenerated) {
           console.log(`[Session] Restored AI-generated asset: ${assetFile.name}`);
         }
       } catch (e) {
-        console.log(`[Session] Could not stat asset ${assetFile.name}`);
+        console.log(`[Session] Could not stat asset ${assetFile.name}: ${e.message}`);
       }
     }
 
@@ -170,6 +244,7 @@ function restoreSessionsFromDisk() {
       editCount: 0,
       assets,
       project: projectState,
+      transcriptCache: new Map(),
     };
 
     sessions.set(sessionId, session);
@@ -201,6 +276,9 @@ function saveAssetMetadata(session) {
       sceneCount: asset.sceneCount,
       sceneDataPath: asset.sceneDataPath,
       editCount: asset.editCount || 0,
+      // Shorts generator metadata
+      sourceAssetId: asset.sourceAssetId,
+      shortMeta: asset.shortMeta,
     };
   }
 
@@ -269,7 +347,6 @@ function cleanupSession(sessionId) {
   const session = sessions.get(sessionId);
   if (session) {
     try {
-      const { rmSync } = require('fs');
       rmSync(session.dir, { recursive: true, force: true });
       sessions.delete(sessionId);
       console.log(`[Session] Cleaned up: ${sessionId}`);
@@ -387,6 +464,54 @@ async function detectSilence(inputPath, jobId, options = {}) {
 }
 
 // Get video/audio duration (returns 0 for images)
+/** Mean loudness in dB over the first `seconds` of the file (very negative = effectively silent). */
+function meanVolumeDb(inputPath, seconds = 90) {
+  try {
+    const out = execSync(`ffmpeg -hide_banner -nostats -i "${inputPath}" -t ${seconds} -vn -af volumedetect -f null - 2>&1`, { encoding: 'utf-8' });
+    const m = out.match(/mean_volume:\s*(-?[\d.]+) dB/);
+    return m ? Number(m[1]) : null;
+  } catch { return null; }
+}
+
+/**
+ * Where should we read speech from for `videoAsset`? The video itself when it
+ * has a usable audio stream; otherwise the audio asset that "extract audio"
+ * split off it (linked by sourceAssetId), or an explicit hint from the client.
+ * Returns { path, label, audioAsset } or null when there is no sound anywhere.
+ */
+function resolveAudioSource(session, videoAsset, hintAudioAssetId = null) {
+  const videoHasAudio = hasAudioStream(videoAsset.path);
+  const mean = videoHasAudio ? meanVolumeDb(videoAsset.path) : null;
+  if (videoHasAudio && (mean === null || mean > -60)) {
+    return { path: videoAsset.path, label: videoAsset.filename, audioAsset: null, fromVideo: true };
+  }
+  let audioAsset = null;
+  if (hintAudioAssetId && session.assets.has(hintAudioAssetId)) {
+    const a = session.assets.get(hintAudioAssetId);
+    if (a.type === 'audio' && existsSync(a.path)) audioAsset = a;
+  }
+  if (!audioAsset) {
+    for (const [, a] of session.assets) {
+      if (a.type === 'audio' && existsSync(a.path) && a.sourceAssetId && (a.sourceAssetId === videoAsset.sourceAssetId || a.sourceAssetId === videoAsset.id)) { audioAsset = a; break; }
+    }
+  }
+  if (audioAsset) {
+    // The linked audio can itself be silence (a screen recording made with no mic).
+    const audioMean = meanVolumeDb(audioAsset.path);
+    if (audioMean !== null && audioMean <= -60) {
+      return { none: true, reason: `the audio on A1 ("${audioAsset.filename}") is digital silence (${audioMean.toFixed(0)}dB), so the original recording had no microphone sound` };
+    }
+    return { path: audioAsset.path, label: `A1 audio "${audioAsset.filename}"`, audioAsset, fromVideo: false };
+  }
+  if (videoHasAudio) return { none: true, reason: `its audio track is digital silence (${mean.toFixed(0)}dB) — the recording had no microphone sound — and there is no matching audio on A1` };
+  return { none: true, reason: 'it has no audio track and there is no matching audio on A1' };
+}
+
+function noAudioMessage(videoAsset, source) {
+  const reason = source?.reason || 'it has no usable audio';
+  return `"${videoAsset.filename}" has no speech to work with: ${reason}. Re-record with the mic on, or add a voice-over to A1.`;
+}
+
 async function getVideoDuration(inputPath) {
   try {
     const result = execSync(
@@ -501,49 +626,38 @@ async function handleRemoveDeadAir(req, res) {
     const removedDuration = totalDuration - totalKeptDuration;
     console.log(`[${jobId}] Removing ${removedDuration.toFixed(2)}s of dead air (${((removedDuration / totalDuration) * 100).toFixed(1)}%)`);
 
-    // Step 4: Extract each segment (re-encode for accuracy)
-    console.log(`[${jobId}] Extracting segments (re-encoding for frame accuracy)...`);
+    // Single-pass trim+concat filter to keep audio and video in sync
+    console.log(`[${jobId}] Building filter chain for ${keepSegments.length} segments...`);
+
+    const filterParts = [];
+    const videoStreams = [];
+    const audioStreams = [];
+
     for (let i = 0; i < keepSegments.length; i++) {
       const seg = keepSegments[i];
-      const segmentPath = join(TEMP_DIR, `${jobId}-segment-${i}.mp4`);
-      segmentPaths.push(segmentPath);
-
-      // Use -ss after -i for accurate seeking, re-encode to ensure all frames included
-      const args = [
-        '-y',
-        '-i', inputPath,
-        '-ss', seg.start.toString(),
-        '-t', (seg.end - seg.start).toString(),
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast', // Fast encoding for segments
-        '-crf', '18',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        segmentPath
-      ];
-
-      await runFFmpeg(args, jobId);
-      console.log(`\n[${jobId}] Extracted segment ${i + 1}/${keepSegments.length}`);
+      filterParts.push(`[0:v]trim=start=${seg.start}:end=${seg.end},setpts=PTS-STARTPTS[v${i}]`);
+      filterParts.push(`[0:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS[a${i}]`);
+      videoStreams.push(`[v${i}]`);
+      audioStreams.push(`[a${i}]`);
     }
 
-    // Step 5: Create concat list file
-    const concatList = segmentPaths.map(p => `file '${p}'`).join('\n');
-    writeFileSync(concatListPath, concatList);
+    filterParts.push(`${videoStreams.join('')}concat=n=${keepSegments.length}:v=1:a=0[outv]`);
+    filterParts.push(`${audioStreams.join('')}concat=n=${keepSegments.length}:v=0:a=1[outa]`);
 
-    // Step 6: Concatenate all segments (just copy since they're already encoded)
-    console.log(`[${jobId}] Concatenating ${keepSegments.length} segments...`);
-    const concatArgs = [
-      '-y',
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', concatListPath,
-      '-c', 'copy',
+    const filterComplex = filterParts.join(';');
+
+    const args = [
+      '-y', '-i', inputPath,
+      '-filter_complex', filterComplex,
+      '-map', '[outv]', '-map', '[outa]',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+      '-c:a', 'aac', '-b:a', '192k',
       '-movflags', '+faststart',
       outputPath
     ];
 
-    await runFFmpeg(concatArgs, jobId);
-    console.log(`\n[${jobId}] Concatenation complete`);
+    await runFFmpeg(args, jobId);
+    console.log(`\n[${jobId}] Dead air removal complete`);
 
     // Read output file and send it back
     const outputStats = await stat(outputPath);
@@ -1160,12 +1274,29 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
 
     console.log(`\n[${jobId}] === DEAD AIR REMOVAL (Session) ===`);
 
-    // Find the video asset (use new multi-asset system instead of legacy currentVideo)
+    // Prefer the asset the client named (the clip on V1). Only scan the
+    // library when none was given, so an unrelated imported clip is never picked.
     let videoAsset = null;
+    if (options.assetId && session.assets.has(options.assetId)) {
+      const requested = session.assets.get(options.assetId);
+      if (requested.type === 'video') videoAsset = requested;
+      else console.warn(`[${jobId}] Requested asset ${options.assetId} is ${requested.type}, not video; falling back`);
+    }
+    // Find the original (non-AI-generated) video asset
     for (const [assetId, asset] of session.assets) {
-      if (asset.type === 'video') {
+      if (videoAsset) break;
+      if (asset.type === 'video' && !asset.aiGenerated && !asset.shortMeta) {
         videoAsset = asset;
         break;
+      }
+    }
+    // Fallback to any video if no original found
+    if (!videoAsset) {
+      for (const [assetId, asset] of session.assets) {
+        if (asset.type === 'video') {
+          videoAsset = asset;
+          break;
+        }
       }
     }
 
@@ -1191,7 +1322,52 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
     const totalDuration = await getVideoDuration(videoAsset.path);
     console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
 
-    const silencePeriods = await detectSilence(videoAsset.path, jobId, {
+    // ---- Where is the sound? ----
+    // After "extract audio" the V1 file is muted and the speech lives in a
+    // separate A1 asset. Detect silence on whichever file actually carries the
+    // audio, and cut that audio file with the same segments so V1/A1 stay in sync.
+    let audioAsset = null; // separate audio file to cut alongside the video
+    if (options.audioAssetId && session.assets.has(options.audioAssetId)) {
+      const a = session.assets.get(options.audioAssetId);
+      if (a.type === 'audio') audioAsset = a;
+    }
+    if (!audioAsset) {
+      // Sibling produced by extract-audio from the same original
+      for (const [, a] of session.assets) {
+        if (a.type === 'audio' && a.sourceAssetId && (a.sourceAssetId === videoAsset.sourceAssetId || a.sourceAssetId === videoAsset.id)) { audioAsset = a; break; }
+      }
+    }
+
+    const videoHasAudio = hasAudioStream(videoAsset.path);
+    const videoMeanDb = videoHasAudio ? meanVolumeDb(videoAsset.path) : null;
+    const videoAudioUsable = videoHasAudio && (videoMeanDb === null || videoMeanDb > -60);
+    let detectPath = videoAsset.path;
+    let detectLabel = 'video track';
+    if (!videoAudioUsable && audioAsset && existsSync(audioAsset.path)) {
+      detectPath = audioAsset.path;
+      detectLabel = `A1 audio "${audioAsset.filename}"`;
+    } else if (videoAudioUsable && audioAsset && !existsSync(audioAsset.path)) {
+      audioAsset = null;
+    }
+    if (!videoAudioUsable && detectPath === videoAsset.path) {
+      const why = videoHasAudio ? `its audio track is digital silence (${videoMeanDb.toFixed(0)}dB), so the recording had no microphone sound` : 'it has no audio track';
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `"${videoAsset.filename}" has no speech to listen to: ${why}, and there is no matching audio on A1. Dead air removal needs a voice.` }));
+      return;
+    }
+    if (!videoAudioUsable && audioAsset) {
+      const a1Mean = meanVolumeDb(audioAsset.path);
+      if (a1Mean !== null && a1Mean <= -60) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: `The audio on A1 ("${audioAsset.filename}") is digital silence (${a1Mean.toFixed(0)}dB): the original recording had no microphone sound. Dead air removal needs a voice.` }));
+        return;
+      }
+    }
+    // Only cut the audio file alongside when it is the source of truth for timing.
+    if (audioAsset && detectPath !== audioAsset.path) audioAsset = null;
+    console.log(`[${jobId}] Detecting silence from ${detectLabel}${videoMeanDb !== null ? ` (video mean ${videoMeanDb.toFixed(0)}dB)` : ''}`);
+
+    const silencePeriods = await detectSilence(detectPath, jobId, {
       silenceThreshold,
       minSilenceDuration,
     });
@@ -1210,6 +1386,16 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
 
     const keepSegments = calculateKeepSegments(silencePeriods, totalDuration);
     console.log(`[${jobId}] Keeping ${keepSegments.length} segments`);
+
+    // Guard: a clip that is silent end to end (no speech, muted, or an empty
+    // audio track) yields nothing to keep. Say so instead of feeding FFmpeg an
+    // empty concat list.
+    if (keepSegments.length === 0) {
+      console.warn(`[${jobId}] Entire ${detectLabel} is below ${silenceThreshold}dB — nothing to keep`);
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `The ${detectLabel} is silent from start to finish (everything is below ${silenceThreshold}dB), so there's nothing to keep. Dead air removal needs a clip with speech.` }));
+      return;
+    }
 
     const totalKeptDuration = keepSegments.reduce((sum, seg) => sum + (seg.end - seg.start), 0);
     const removedDuration = totalDuration - totalKeptDuration;
@@ -1235,12 +1421,54 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
       console.log(`\n[${jobId}] Segment ${i + 1}/${keepSegments.length}`);
     }
 
+    // Same segments from the separate audio file, so A1 stays in sync with V1.
+    // Audio-only, so one filter-graph pass (atrim + concat) is safe here; the
+    // per-segment files are only needed for video. This avoids the MP3 frame
+    // padding that accumulates when concatenating many small audio files.
+    let audioOutputPath = null;
+    if (audioAsset) {
+      const audioExt = (audioAsset.path.split('.').pop() || 'mp3').toLowerCase();
+      const audioCodecArgs = audioExt === 'mp3' ? ['-c:a', 'libmp3lame', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '192k'];
+      // atrim each kept span, then concat: sample-accurate and the same boundaries as the video segments.
+      const trims = keepSegments.map((seg, i) => `[0:a]atrim=${seg.start.toFixed(3)}:${seg.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`).join(';');
+      const concatInputs = keepSegments.map((_, i) => `[a${i}]`).join('');
+      const graph = `${trims};${concatInputs}concat=n=${keepSegments.length}:v=0:a=1[out]`;
+      audioOutputPath = join(session.dir, `deadair-audio-${Date.now()}.${audioExt}`);
+      console.log(`[${jobId}] Cutting ${audioAsset.filename} with the same ${keepSegments.length} segments...`);
+      await runFFmpeg(['-y', '-i', audioAsset.path, '-filter_complex', graph, '-map', '[out]', ...audioCodecArgs, audioOutputPath], jobId);
+    }
+
     // Concatenate
     const concatList = segmentPaths.map(p => `file '${p}'`).join('\n');
     writeFileSync(concatListPath, concatList);
 
     console.log(`[${jobId}] Concatenating...`);
     await runFFmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', concatListPath, '-c', 'copy', '-movflags', '+faststart', outputPath], jobId);
+
+    console.log(`\n[${jobId}] Dead air removal complete`);
+
+    // Verify output has audio before replacing original
+    const probeResult = execSync(
+      `ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "${outputPath}"`,
+      { encoding: 'utf-8' }
+    );
+    const streams = probeResult.trim().split('\n');
+    console.log(`\n🔍 [${jobId}] OUTPUT FILE PROBE:`);
+    console.log(`🔍 [${jobId}]   Streams: ${streams.join(', ')}`);
+    console.log(`🔍 [${jobId}]   Has video: ${streams.includes('video')}`);
+    console.log(`🔍 [${jobId}]   Has audio: ${streams.includes('audio')}`);
+    console.log(`🔍 [${jobId}]   Output path: ${outputPath}`);
+
+    // Also probe the ORIGINAL file for comparison
+    const origProbe = execSync(
+      `ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "${videoAsset.path}"`,
+      { encoding: 'utf-8' }
+    );
+    console.log(`🔍 [${jobId}]   Original streams: ${origProbe.trim().split('\n').join(', ')}`);
+
+    // Cleanup segments
+    segmentPaths.forEach(p => { try { unlinkSync(p); } catch {} });
+    try { unlinkSync(concatListPath); } catch {}
 
     // Replace the video asset file
     const { rename, stat } = await import('fs/promises');
@@ -1257,6 +1485,19 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
     videoAsset.duration = totalKeptDuration;
     videoAsset.size = newStats.size;
 
+    // Replace the audio asset file too
+    let audioResult = null;
+    if (audioAsset && audioOutputPath && existsSync(audioOutputPath)) {
+      unlinkSync(audioAsset.path);
+      await rename(audioOutputPath, audioAsset.path);
+      const audioStats = await stat(audioAsset.path);
+      audioAsset.duration = totalKeptDuration;
+      audioAsset.size = audioStats.size;
+      audioResult = { assetId: audioAsset.id, duration: totalKeptDuration };
+      console.log(`[${jobId}] ✓ A1 audio cut to match: ${audioAsset.filename}`);
+    }
+    saveAssetMetadata(session);
+
     session.editCount++;
 
     console.log(`\n[${jobId}] === DEAD AIR REMOVAL COMPLETE ===`);
@@ -1269,6 +1510,8 @@ async function handleSessionRemoveDeadAir(req, res, sessionId) {
       removedDuration,
       size: newStats.size,
       editCount: session.editCount,
+      detectedFrom: detectLabel,
+      audio: audioResult,
     }));
 
   } catch (error) {
@@ -1304,13 +1547,23 @@ async function handleSessionChapters(req, res, sessionId) {
     // Find video path - check both legacy currentVideo and new assets system
     let videoPath = session.currentVideo;
     if (!videoPath || !existsSync(videoPath)) {
-      // Try to find video from assets
+      // Try to find original (non-AI) video from assets
       if (session.assets && session.assets.size > 0) {
         for (const [, asset] of session.assets) {
-          if (asset.type === 'video' && existsSync(asset.path)) {
+          if (asset.type === 'video' && !asset.aiGenerated && existsSync(asset.path)) {
             videoPath = asset.path;
             console.log(`[${jobId}] Using video asset: ${asset.filename}`);
             break;
+          }
+        }
+        // Fallback to any video
+        if (!videoPath || !existsSync(videoPath)) {
+          for (const [, asset] of session.assets) {
+            if (asset.type === 'video' && existsSync(asset.path)) {
+              videoPath = asset.path;
+              console.log(`[${jobId}] Using video asset (fallback): ${asset.filename}`);
+              break;
+            }
           }
         }
       }
@@ -1640,6 +1893,8 @@ function handleAssetList(req, res, sessionId) {
     height: asset.height,
     thumbnailUrl: asset.thumbPath ? `/session/${sessionId}/assets/${asset.id}/thumbnail` : null,
     aiGenerated: asset.aiGenerated || false, // True for Remotion-generated animations
+    sourceAssetId: asset.sourceAssetId,
+    shortMeta: asset.shortMeta, // Present on clips produced by the Shorts generator
   }));
 
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -1829,6 +2084,7 @@ function handleProjectGet(req, res, sessionId) {
     tracks: session.project.tracks,
     clips: session.project.clips,
     settings: session.project.settings,
+    timelineTabs: session.project.timelineTabs || [],
   }));
 }
 
@@ -1849,12 +2105,16 @@ async function handleProjectSave(req, res, sessionId) {
     if (data.tracks) session.project.tracks = data.tracks;
     if (data.clips) session.project.clips = data.clips;
     if (data.settings) session.project.settings = { ...session.project.settings, ...data.settings };
+    // Persist edit-tab clips so animations being edited in a tab survive
+    // page reloads. Without this, opening an animation in a tab and then
+    // refreshing the browser nukes the tab and the user's edits.
+    if (data.timelineTabs) session.project.timelineTabs = data.timelineTabs;
 
     // Save to disk for persistence
     const projectPath = join(session.dir, 'project.json');
     writeFileSync(projectPath, JSON.stringify(session.project, null, 2));
 
-    console.log(`[${sessionId}] Project saved: ${session.project.clips.length} clips`);
+    console.log(`[${sessionId}] Project saved: ${session.project.clips.length} clips, ${(session.project.timelineTabs || []).length} edit tab(s)`);
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ success: true }));
@@ -1866,6 +2126,120 @@ async function handleProjectSave(req, res, sessionId) {
 }
 
 // Render project to video
+// Quick check whether a media file contains an audio stream. Used by the
+// render pipeline to decide which inputs to mix into the output.
+function hasAudioStream(filePath) {
+  try {
+    const result = execSync(
+      `ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+      { encoding: 'utf-8' }
+    ).trim();
+    return result === 'audio';
+  } catch {
+    return false;
+  }
+}
+
+// Format a number of seconds as an ASS timestamp: H:MM:SS.cc (centiseconds)
+function formatAssTime(seconds) {
+  const total = Math.max(0, seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = Math.floor(total % 60);
+  const cs = Math.floor((total - Math.floor(total)) * 100);
+  const pad = (n) => n.toString().padStart(2, '0');
+  return `${hours}:${pad(minutes)}:${pad(secs)}.${pad(cs)}`;
+}
+
+// Build an Advanced SubStation Alpha (.ass) file from caption clips on T1.
+// We use .ass instead of SRT because libass uses a virtual 288px coordinate
+// space when reading SRT, which makes Fontsize unpredictable and force_style
+// can't override PlayResY. With a real .ass header (PlayResX/PlayResY) every
+// size below is in actual output pixels.
+//
+// The editor renders captions in CSS pixels on a fixed-height preview pane
+// (`h-[65vh]` ≈ 650px tall). To make the export visually match the editor,
+// we scale fontSize from the preview reference to the output height.
+function buildAssFromCaptions(clips, captions, settings) {
+  const captionClips = clips
+    .filter(c => c.trackId === 'T1')
+    .filter(c => captions && captions[c.id]?.words?.length)
+    .sort((a, b) => a.start - b.start);
+
+  if (captionClips.length === 0) return null;
+
+  // Use the first caption clip's style as the doc-wide default. v1 limitation:
+  // mixing styles per clip would require a Style entry per clip.
+  const styled = captionClips.find(c => captions[c.id]?.style);
+  const style = (styled && captions[styled.id].style) || {};
+
+  // The editor's video preview pane is roughly 650px tall (h-65vh on a
+  // typical desktop). The CaptionRenderer applies fontSize as raw CSS px in
+  // that pane, so a 24px caption visually occupies ~3.7% of the pane height.
+  // We replicate that proportion against the actual output height.
+  const previewRefHeight = 650;
+  const fontPx = Math.max(8, Math.round((style.fontSize || 24) * settings.height / previewRefHeight));
+  const outlineWidth = Math.max(1, Math.round((style.strokeWidth ?? 2) * settings.height / previewRefHeight));
+
+  const fontName = (style.fontFamily || 'Arial').replace(/[,&]/g, '');
+  const primaryColor = libassColor(style.color || '#FFFFFF');
+  const outlineColor = libassColor(style.strokeColor || '#000000');
+  const alignment = captionAlignment(style.position);
+  const marginV = Math.round(settings.height * 0.08); // matches CSS `top/bottom: 8%`
+  const bold = (style.fontWeight === 'bold' || style.fontWeight === 'black') ? -1 : 0;
+
+  const header = [
+    '[Script Info]',
+    'Title: HyperEdit Captions',
+    'ScriptType: v4.00+',
+    `PlayResX: ${settings.width}`,
+    `PlayResY: ${settings.height}`,
+    'WrapStyle: 0',
+    'ScaledBorderAndShadow: yes',
+    '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    `Style: Default,${fontName},${fontPx},${primaryColor},&H000000FF,${outlineColor},&H00000000,${bold},0,0,0,100,100,0,0,1,${outlineWidth},0,${alignment},20,20,${marginV},1`,
+    '',
+    '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+  ];
+
+  const events = [];
+  for (const clip of captionClips) {
+    const data = captions[clip.id];
+    const text = data.words.map(w => w.text).join(' ').trim();
+    if (!text) continue;
+    // Escape ASS special chars: backslash and braces.
+    const escapedText = text.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}');
+    const start = formatAssTime(clip.start);
+    const end = formatAssTime(clip.start + clip.duration);
+    events.push(`Dialogue: 0,${start},${end},Default,,0,0,0,,${escapedText}`);
+  }
+
+  return events.length > 0 ? [...header, ...events].join('\n') : null;
+}
+
+// Map our CaptionStyle.position to the libass alignment integer:
+//   bottom = 2 (bottom-center), center = 5 (middle-center), top = 8 (top-center)
+function captionAlignment(position) {
+  if (position === 'top') return 8;
+  if (position === 'center') return 5;
+  return 2;
+}
+
+// Convert a CSS hex color (`#RRGGBB`) to libass's `&HAABBGGRR` byte order
+// (alpha=00 = fully opaque). Falls back to white on parse failure.
+function libassColor(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return '&H00FFFFFF';
+  const rgb = m[1];
+  const r = rgb.slice(0, 2);
+  const g = rgb.slice(2, 4);
+  const b = rgb.slice(4, 6);
+  return `&H00${b.toUpperCase()}${g.toUpperCase()}${r.toUpperCase()}`;
+}
+
 async function handleProjectRender(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -1879,6 +2253,7 @@ async function handleProjectRender(req, res, sessionId) {
     for await (const chunk of req) body += chunk;
     const options = body ? JSON.parse(body) : {};
     const isPreview = options.preview === true;
+    const captions = options.captions || {};
 
     const clips = session.project.clips;
     const settings = session.project.settings;
@@ -1892,9 +2267,23 @@ async function handleProjectRender(req, res, sessionId) {
     console.log(`\n[${sessionId}] === RENDER ${isPreview ? 'PREVIEW' : 'EXPORT'} ===`);
     console.log(`[${sessionId}] ${clips.length} clips, ${settings.width}x${settings.height}`);
 
-    // Sort clips by track for layering (V1 first, then V2, etc.)
+    // Surface clips that reference unknown assets — these would otherwise
+    // be silently dropped from the export.
+    for (const clip of clips) {
+      if (clip.trackId === 'T1') continue; // T1 = captions, no asset needed
+      if (!clip.assetId) continue;
+      const asset = session.assets.get(clip.assetId);
+      if (!asset) {
+        console.warn(`[${sessionId}] ⚠ Clip ${clip.id.slice(0,8)} on ${clip.trackId} references missing asset ${clip.assetId.slice(0,8)} — DROPPED FROM EXPORT`);
+      } else if (asset.duration === undefined || asset.duration === null) {
+        console.warn(`[${sessionId}] ⚠ Clip ${clip.id.slice(0,8)} on ${clip.trackId} (${asset.filename}) has no duration metadata — may render incorrectly`);
+      }
+    }
+
+    // Sort video clips so V1 (base) is overlaid first, then V2, then V3.
     const videoClips = clips
       .filter(c => session.assets.get(c.assetId)?.type !== 'audio')
+      .filter(c => session.assets.get(c.assetId))
       .sort((a, b) => {
         const trackOrder = { 'V1': 0, 'V2': 1, 'V3': 2 };
         return (trackOrder[a.trackId] || 0) - (trackOrder[b.trackId] || 0);
@@ -1903,89 +2292,130 @@ async function handleProjectRender(req, res, sessionId) {
     const audioClips = clips
       .filter(c => session.assets.get(c.assetId)?.type === 'audio');
 
-    // Calculate total duration from all clips
+    console.log(`[${sessionId}] Will render ${videoClips.length} video clip(s) + ${audioClips.length} audio clip(s)`);
+    for (const c of videoClips) {
+      const a = session.assets.get(c.assetId);
+      console.log(`[${sessionId}]   → ${c.trackId} | ${a.filename} | start=${c.start}s dur=${c.duration}s ai=${a.aiGenerated || false}`);
+    }
+
     const totalDuration = Math.max(
       ...clips.map(c => c.start + c.duration),
       0.1
     );
 
-    // Build FFmpeg filter_complex
+    // Assign a single input index per clip so video and audio filter chains
+    // reference the same inputs. Video clips get loaded first (so V1/V2/V3
+    // inputs are contiguous), then dedicated audio clips.
     const inputs = [];
     const filterParts = [];
     let inputIndex = 0;
+    const clipInputs = []; // [{ clip, asset, inputIdx, kind: 'video' | 'audio' }]
 
-    // Create black background
-    filterParts.push(`color=black:s=${settings.width}x${settings.height}:d=${totalDuration}:r=${settings.fps}[base]`);
-    let lastVideo = 'base';
-
-    // Process video clips
     for (const clip of videoClips) {
       const asset = session.assets.get(clip.assetId);
       if (!asset) continue;
-
       inputs.push('-i', asset.path);
-      const idx = inputIndex++;
+      clipInputs.push({ clip, asset, inputIdx: inputIndex++, kind: 'video' });
+    }
+    for (const clip of audioClips) {
+      const asset = session.assets.get(clip.assetId);
+      if (!asset) continue;
+      inputs.push('-i', asset.path);
+      clipInputs.push({ clip, asset, inputIdx: inputIndex++, kind: 'audio' });
+    }
 
-      // Apply trim and scale
-      const inPoint = clip.inPoint || 0;
-      const outPoint = clip.outPoint || asset.duration;
+    // Base canvas spans the whole timeline so every overlay has something to
+    // composite against, even in the gaps between clips.
+    filterParts.push(`color=black:s=${settings.width}x${settings.height}:d=${totalDuration}:r=${settings.fps}[base]`);
+    let lastVideo = 'base';
+
+    // Build the video overlay chain. CRITICAL: each clip's PTS is shifted to
+    // `clip.start` (`setpts=PTS-STARTPTS+clip.start/TB`). Without that offset
+    // every clip's frames are at PTS 0..trimDuration, so when the output is
+    // at t=clip.start the overlay filter has already exhausted the clip and
+    // freezes on the last frame for the entire enable window.
+    for (const { clip, asset, inputIdx, kind } of clipInputs) {
+      if (kind !== 'video') continue;
+
+      // Defensive trim bounds: prefer the clip's explicit out, fall back to
+      // asset duration, then to clip.duration. Whatever we end up with must
+      // be a finite positive number — otherwise ffmpeg gets `trim=0:NaN` and
+      // silently drops the clip from the chain.
+      const inPoint = Number.isFinite(clip.inPoint) ? clip.inPoint : 0;
+      let outPoint = Number.isFinite(clip.outPoint) ? clip.outPoint : (Number.isFinite(asset.duration) ? asset.duration : null);
+      if (!Number.isFinite(outPoint) || outPoint <= inPoint) {
+        outPoint = inPoint + (Number.isFinite(clip.duration) ? clip.duration : 1);
+        console.warn(`[${sessionId}] Clip ${clip.id.slice(0,8)} (${asset.filename}) had invalid outPoint, recovered with outPoint=${outPoint}`);
+      }
       const trimDuration = outPoint - inPoint;
 
-      let clipFilter = `[${idx}:v]`;
-
-      // Trim
-      clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS,`;
-
-      // Scale/fit to canvas
+      let clipFilter = `[${inputIdx}:v]`;
+      clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+${clip.start}/TB,`;
       clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
       clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
 
-      // Apply transform if present
       if (clip.transform) {
-        const { x = 0, y = 0, scale = 1, opacity = 1 } = clip.transform;
+        const { scale = 1 } = clip.transform;
         if (scale !== 1) {
           clipFilter += `,scale=iw*${scale}:ih*${scale}`;
         }
-        // Opacity is handled in overlay
       }
 
-      clipFilter += `[v${idx}]`;
+      clipFilter += `[v${inputIdx}]`;
       filterParts.push(clipFilter);
 
-      // Overlay onto base
       const overlayX = clip.transform?.x || `(W-w)/2`;
       const overlayY = clip.transform?.y || `(H-h)/2`;
       const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
 
-      filterParts.push(`[${lastVideo}][v${idx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${idx}]`);
-      lastVideo = `out${idx}`;
+      filterParts.push(`[${lastVideo}][v${inputIdx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${inputIdx}]`);
+      lastVideo = `out${inputIdx}`;
     }
 
-    // Rename final output
-    filterParts.push(`[${lastVideo}]copy[vout]`);
+    // Burn captions onto the composite. We build a real .ass file with
+    // PlayResY = output height so all sizes (Fontsize, MarginV, Outline) are
+    // in actual output pixels. Caption data is posted from the React client
+    // on each render request — it's not persisted server-side.
+    const assBody = buildAssFromCaptions(clips, captions, settings);
+    let videoChainTail = lastVideo;
+    if (assBody) {
+      const assPath = join(session.dir, `render-captions-${Date.now()}.ass`);
+      writeFileSync(assPath, assBody, 'utf-8');
 
-    // Audio mixing
-    let audioFilter = '';
-    if (audioClips.length > 0) {
-      const audioInputs = [];
-      for (const clip of audioClips) {
-        const asset = session.assets.get(clip.assetId);
-        if (!asset) continue;
+      // ffmpeg's `subtitles` filter parser is quoted-arg sensitive — escape
+      // colons in the path so it isn't read as a key=value separator.
+      const escapedPath = assPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+      filterParts.push(`[${videoChainTail}]subtitles='${escapedPath}'[vcaptioned]`);
+      videoChainTail = 'vcaptioned';
+      console.log(`[${sessionId}] Captions: ${assBody.split('\nDialogue:').length - 1} lines burned in`);
+    }
 
-        inputs.push('-i', asset.path);
-        const idx = inputIndex++;
-        const inPoint = clip.inPoint || 0;
-        const outPoint = clip.outPoint || asset.duration;
+    filterParts.push(`[${videoChainTail}]copy[vout]`);
 
-        audioInputs.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${Math.floor(clip.start * 1000)}|${Math.floor(clip.start * 1000)}[a${idx}]`);
-      }
+    // Build audio: only V1 video audio + dedicated A1/A2 audio. V2/V3 video
+    // overlays (b-roll, gifs, animations) are MUTED in the editor preview
+    // (VideoPreview.tsx renders overlay videos with `muted`), so the export
+    // matches that — otherwise every overlay's background noise leaks into
+    // the final mix.
+    const audioStreams = [];
+    for (const { clip, asset, inputIdx, kind } of clipInputs) {
+      if (kind === 'video' && clip.trackId !== 'V1') continue;
+      if (!hasAudioStream(asset.path)) continue;
+      const inPoint = clip.inPoint || 0;
+      const outPoint = clip.outPoint || asset.duration;
+      const delayMs = Math.max(0, Math.floor(clip.start * 1000));
+      filterParts.push(
+        `[${inputIdx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}[aud${inputIdx}]`
+      );
+      audioStreams.push(`[aud${inputIdx}]`);
+    }
 
-      if (audioInputs.length > 0) {
-        filterParts.push(...audioInputs);
-        const audioMix = audioInputs.map((_, i) => `[a${clips.indexOf(audioClips[i]) + videoClips.length}]`).join('');
-        filterParts.push(`${audioMix}amix=inputs=${audioInputs.length}[aout]`);
-        audioFilter = '-map [aout]';
-      }
+    let hasAudioOutput = false;
+    if (audioStreams.length > 0) {
+      filterParts.push(
+        `${audioStreams.join('')}amix=inputs=${audioStreams.length}:dropout_transition=0:normalize=0[aout]`
+      );
+      hasAudioOutput = true;
     }
 
     // Build final command
@@ -1998,7 +2428,7 @@ async function handleProjectRender(req, res, sessionId) {
       '-map', '[vout]',
     ];
 
-    if (audioFilter) {
+    if (hasAudioOutput) {
       ffmpegArgs.push('-map', '[aout]');
     }
 
@@ -2050,7 +2480,6 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   }
 
   // Find the render file
-  const { readdirSync } = require('fs');
   const files = readdirSync(session.rendersDir);
 
   let renderFile;
@@ -2706,10 +3135,13 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
     throw new Error('No transcription method available. Install local Whisper or set OPENAI_API_KEY/GEMINI_API_KEY');
   }
 
-  // Extract audio from video
+  // Extract audio from whichever file actually carries the speech
+  const audioSource = resolveAudioSource(session, videoAsset);
+  if (!audioSource || audioSource.none) throw new Error(noAudioMessage(videoAsset, audioSource));
+  if (!audioSource.fromVideo) console.log(`[${jobId}] Reading speech from ${audioSource.label}`);
   const audioPath = join(TEMP_DIR, `${jobId}-transcript-audio.mp3`);
   await runFFmpeg([
-    '-y', '-i', videoAsset.path,
+    '-y', '-i', audioSource.path,
     '-vn', '-acodec', 'libmp3lame', '-q:a', '4',
     audioPath
   ], jobId);
@@ -2917,7 +3349,7 @@ async function handleTranscribe(req, res, sessionId) {
     for await (const chunk of req) {
       body += chunk;
     }
-    const { assetId } = JSON.parse(body || '{}');
+    const { assetId, audioAssetId } = JSON.parse(body || '{}');
 
     // Determine which method to use
     const useLocalWhisper = hasLocalWhisper;
@@ -2940,11 +3372,20 @@ async function handleTranscribe(req, res, sessionId) {
     if (assetId) {
       videoAsset = session.assets.get(assetId);
     } else {
-      // If no assetId, find the first video asset
+      // If no assetId, prefer the original (non-AI-generated) video asset
       for (const asset of session.assets.values()) {
-        if (asset.type === 'video') {
+        if (asset.type === 'video' && !asset.aiGenerated) {
           videoAsset = asset;
           break;
+        }
+      }
+      // Fallback to any video if no non-AI video found
+      if (!videoAsset) {
+        for (const asset of session.assets.values()) {
+          if (asset.type === 'video') {
+            videoAsset = asset;
+            break;
+          }
         }
       }
     }
@@ -2961,10 +3402,17 @@ async function handleTranscribe(req, res, sessionId) {
     const totalDuration = await getVideoDuration(videoAsset.path);
     console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
 
-    // Extract audio as MP3
-    console.log(`[${jobId}] Extracting audio...`);
+    // Read speech from the file that actually has it (muted V1 → linked A1 audio)
+    const audioSource = resolveAudioSource(session, videoAsset, audioAssetId || null);
+    if (!audioSource || audioSource.none) {
+      console.warn(`[${jobId}] No usable speech: ${audioSource?.reason || 'no audio'}`);
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: noAudioMessage(videoAsset, audioSource) }));
+      return;
+    }
+    console.log(`[${jobId}] Extracting audio from ${audioSource.label}...`);
     await runFFmpeg([
-      '-y', '-i', videoAsset.path,
+      '-y', '-i', audioSource.path,
       '-vn', '-acodec', 'libmp3lame',
       '-ab', '64k', '-ar', '16000', '-ac', '1',
       audioPath
@@ -3169,8 +3617,8 @@ Guidelines:
       res.end(JSON.stringify({
         error: 'No speech detected. Make sure the video has clear, audible speech.',
         debug: {
-          rawResponseLength: responseText.length,
-          rawResponsePreview: responseText.substring(0, 200)
+          transcriptionText: (transcription.text || '').substring(0, 200),
+          wordCount: (transcription.words || []).length
         }
       }));
       return;
@@ -3208,12 +3656,17 @@ async function handleTranscribeAndExtract(req, res, sessionId) {
   try {
     console.log(`\n[${jobId}] === TRANSCRIBE & EXTRACT KEYWORDS ===`);
 
-    // Find the first video asset in the session
+    // Find the original (non-AI-generated) video asset
     let videoAsset = null;
     for (const asset of session.assets.values()) {
-      if (asset.type === 'video') {
+      if (asset.type === 'video' && !asset.aiGenerated) {
         videoAsset = asset;
         break;
+      }
+    }
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video') { videoAsset = asset; break; }
       }
     }
 
@@ -3428,12 +3881,17 @@ async function handleGenerateBroll(req, res, sessionId) {
       return;
     }
 
-    // Find the first video asset in the session
+    // Find the original (non-AI-generated) video asset
     let videoAsset = null;
     for (const asset of session.assets.values()) {
-      if (asset.type === 'video') {
+      if (asset.type === 'video' && !asset.aiGenerated) {
         videoAsset = asset;
         break;
+      }
+    }
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video') { videoAsset = asset; break; }
       }
     }
 
@@ -3961,7 +4419,7 @@ Return ONLY valid JSON (no markdown, no code blocks) with this structure:
     {
       "id": "unique-id",
       "type": "title" | "steps" | "features" | "stats" | "text" | "transition" | "media" | "chart" | "comparison" | "countdown" | "shapes" | "emoji" | "gif" | "lottie",
-      "duration": <number of frames at 30fps, typically 60-150>,
+      "duration": <number of frames at 30fps, typically 45-90 (1.5-3 seconds per scene). Keep scenes SHORT and punchy!>,
       "content": {
         "title": "optional title text",
         "subtitle": "optional subtitle",
@@ -4092,7 +4550,9 @@ Scene transitions (add to scene to animate entry/exit):
 - "duration": frames for transition (default 15, use 20-30 for dramatic)
 
 Guidelines:
-- Keep it concise: 3-6 scenes max
+- Use MORE scenes with SHORTER durations (1.5-3 seconds each, 45-90 frames). Fast cuts feel dynamic and engaging!
+- For a 5s animation use 3-4 scenes, for 10s use 5-7 scenes, for 15s use 7-10 scenes, for 30s use 12-18 scenes. Scale up proportionally.
+- NO scene should exceed 120 frames (4 seconds) unless it's a countdown or media showcase.
 - Total duration: ${durationSeconds ? `EXACTLY ${durationSeconds} seconds (${Math.round(durationSeconds * fps)} frames) - the user specifically requested this duration!` : '5-15 seconds (150-450 frames)'}
 - Use vibrant colors: #f97316 (orange), #3b82f6 (blue), #22c55e (green), #8b5cf6 (purple), #ec4899 (pink)
 - Make it visually engaging with good pacing
@@ -4108,6 +4568,15 @@ IMPORTANT - ADD CAMERA MOVEMENTS to make scenes dynamic:
 - When showing numbers/stats, use numericValue for animated counting effect
 - ADD TRANSITIONS between scenes! Use "swipe-left" or "swipe-right" for dynamic flow, "fade" for elegance, or "zoom-in" for impact
 - Mix transition types for variety (e.g., first scene: swipe-right, second: fade, third: swipe-left)
+
+IMPORTANT - ADD GIF SCENES for humor and engagement:
+- ALWAYS include at least 1-2 "gif" type scenes in every animation for comedic/reaction effects!
+- Use "gifSearch" with funny, relevant search terms that match the topic (e.g., "mind blown", "excited", "wait what", "money rain", "mic drop")
+- Place GIF scenes BETWEEN informational scenes as punchlines or reactions to what was just shown
+- Use "gifLayout": "fullscreen" for maximum impact, or "pip" for a subtle corner reaction
+- GIFs make animations feel fun, relatable, and meme-worthy - lean into humor!
+- Example: After a stats scene showing impressive numbers, add a "gif" scene with "gifSearch": "mind blown" or "impressed"
+- For intros, try "lets go" or "hype". For outros, try "mic drop" or "thats all folks"
 ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the attached images/videos!
 - Use "mediaAnimation": {"type": "ken-burns", "intensity": 0.3} to add dynamic movement to images/videos
 - Use "background" mediaStyle with "overlayText" for cinematic text-over-video effect
@@ -4143,7 +4612,25 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
       console.log(`[${jobId}] ⚠️ No camera movements in any scene`);
     }
 
-    const totalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+    let totalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+
+    // Enforce user-requested duration by scaling scene durations proportionally
+    if (durationSeconds) {
+      const targetFrames = Math.round(durationSeconds * fps);
+      if (totalDuration !== targetFrames && totalDuration > 0) {
+        const scale = targetFrames / totalDuration;
+        console.log(`[${jobId}] ⏱️ Adjusting duration: Gemini gave ${totalDuration} frames (${(totalDuration / fps).toFixed(1)}s), user requested ${durationSeconds}s (${targetFrames} frames). Scale: ${scale.toFixed(2)}x`);
+        for (const scene of sceneData.scenes) {
+          const oldDuration = scene.duration;
+          scene.duration = Math.max(1, Math.round(scene.duration * scale));
+          console.log(`[${jobId}]   Scene "${scene.id}": ${oldDuration} → ${scene.duration} frames`);
+        }
+        totalDuration = sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
+        sceneData.totalDuration = totalDuration;
+        console.log(`[${jobId}] ⏱️ Adjusted total: ${totalDuration} frames (${(totalDuration / fps).toFixed(1)}s)`);
+      }
+    }
+
     const durationInSeconds = totalDuration / fps;
 
     // Inject actual asset file paths for attached media (use absolute file paths for Remotion CLI)
@@ -4327,7 +4814,7 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=swangle', // Software WebGL for headless rendering
+      '--gl=angle', // Use Metal GPU acceleration on macOS
     ];
 
     await new Promise((resolve, reject) => {
@@ -4745,7 +5232,7 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=swangle', // Software WebGL for headless rendering
+      '--gl=angle', // Use Metal GPU acceleration on macOS
     ];
 
     await new Promise((resolve, reject) => {
@@ -5056,7 +5543,7 @@ async function handleGenerateVideo(req, res, sessionId) {
     return;
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -5088,12 +5575,11 @@ async function handleGenerateVideo(req, res, sessionId) {
     console.log(`[${jobId}] Source image: ${imageAsset.filename}`);
     console.log(`[${jobId}] Duration: ${duration}s`);
 
-    // Enhance prompt using Gemini for better video generation
+    // Enhance prompt using Claude for better video generation
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (anthropicApiKey) {
       try {
         console.log(`[${jobId}] Enhancing prompt with DiCaprio AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
         const systemPrompt = `You are DiCaprio, an expert AI prompt engineer specializing in image-to-video generation. Your role is to transform simple motion requests into detailed, cinematic prompts that produce stunning videos.
 
@@ -5121,15 +5607,8 @@ Output: "Cinematic slow zoom in with subtle parallax movement, gentle ambient mo
 Input: "zoom out"
 Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
 
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [
-            { role: 'user', parts: [{ text: systemPrompt }] },
-            { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
-          ],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        const result = await callClaude(anthropicApiKey, systemPrompt, `Enhance this video motion prompt: "${prompt}"`, 800);
+        enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
@@ -5288,7 +5767,7 @@ async function handleRestyleVideo(req, res, sessionId) {
     return;
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
   try {
     const body = await parseBody(req);
@@ -5319,35 +5798,19 @@ async function handleRestyleVideo(req, res, sessionId) {
     console.log(`[${jobId}] User prompt: ${prompt}`);
     console.log(`[${jobId}] Source video: ${videoAsset.filename}`);
 
-    // Enhance prompt using Gemini for better style transfer
+    // Enhance prompt using Claude for better style transfer
     let enhancedPrompt = prompt;
-    if (geminiApiKey) {
+    if (anthropicApiKey) {
       try {
         console.log(`[${jobId}] Enhancing style prompt with AI...`);
-        const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
-        const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
-          contents: [{
-            role: 'user',
-            parts: [{
-              text: `You are an expert at writing prompts for AI video style transfer. Transform this simple style request into a detailed, cinematic prompt that will produce stunning results.
-
-User request: "${prompt}"
-
-Write a detailed prompt describing the visual style. Include:
-- Color grading and mood
-- Texture and grain quality
-- Lighting style
-- Overall aesthetic
-- Any specific visual effects
-
-Return ONLY the enhanced prompt, no explanations.`
-            }]
-          }],
-        });
-
-        enhancedPrompt = result.candidates[0].content.parts[0].text.trim();
+        const result = await callClaude(
+          anthropicApiKey,
+          'You are an expert at writing prompts for AI video style transfer. Transform the user\'s simple style request into a detailed, cinematic prompt that will produce stunning results. Include color grading and mood, texture and grain quality, lighting style, overall aesthetic, and any specific visual effects. Return ONLY the enhanced prompt, no explanations.',
+          `User request: "${prompt}"`,
+          800
+        );
+        enhancedPrompt = result.trim();
         console.log(`[${jobId}] Enhanced prompt: ${enhancedPrompt.substring(0, 100)}...`);
       } catch (e) {
         console.log(`[${jobId}] Prompt enhancement failed, using original: ${e.message}`);
@@ -5901,7 +6364,7 @@ Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
         '--height', String(height),
         '--codec', 'h264',
         '--overwrite',
-        '--gl=swangle', // Software WebGL for headless rendering
+        '--gl=angle', // Use Metal GPU acceleration on macOS
       ];
 
       await new Promise((resolve, reject) => {
@@ -6445,7 +6908,7 @@ async function handleRenderFromConcept(req, res, sessionId) {
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=swangle', // Software WebGL for headless rendering
+      '--gl=angle', // Use Metal GPU acceleration on macOS
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -6803,7 +7266,7 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=swangle', // Software WebGL for headless rendering
+      '--gl=angle', // Use Metal GPU acceleration on macOS
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -7155,7 +7618,7 @@ Use specific terms, concepts, and themes from the transcript.`;
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=swangle', // Software WebGL for headless rendering
+      '--gl=angle', // Use Metal GPU acceleration on macOS
     ];
 
     await new Promise((resolve, reject) => {
@@ -7376,6 +7839,9 @@ async function handleExtractAudio(req, res, sessionId) {
     };
     session.assets.set(mutedVideoAssetId, mutedAsset);
 
+    const extractedMean = meanVolumeDb(audioPath);
+    const audioSilent = extractedMean !== null && extractedMean <= -60;
+    if (audioSilent) console.warn(`[${jobId}] ⚠ Extracted audio is digital silence (${extractedMean.toFixed(0)}dB) — the source recording has no microphone sound`);
     console.log(`[${jobId}] ✓ Audio extracted: ${audioAsset.filename} (${audioDuration.toFixed(2)}s)`);
     console.log(`[${jobId}] ✓ Muted video created: ${mutedAsset.filename}`);
     console.log(`[${jobId}] === EXTRACT AUDIO COMPLETE ===\n`);
@@ -7383,6 +7849,8 @@ async function handleExtractAudio(req, res, sessionId) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       success: true,
+      audioSilent,
+      warning: audioSilent ? `The extracted audio is silent (${extractedMean.toFixed(0)}dB): this recording has no microphone sound.` : undefined,
       audioAsset: {
         id: audioAssetId,
         filename: audioAsset.filename,
@@ -7542,7 +8010,1187 @@ async function handleProcessAsset(req, res, sessionId) {
   }
 }
 
+
+// ============== OBSIDIAN AGENT HANDLERS ==============
+// Searches the "Marketing OS Broll" Obsidian vault (media knowledge graph)
+// and imports matches as regular session assets. See scripts/obsidian-agent.js.
+
+const JSON_CORS = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+
+// GET /session/:id/obsidian/status
+async function handleObsidianStatus(req, res) {
+  res.writeHead(200, JSON_CORS);
+  res.end(JSON.stringify({ success: true, ...getObsidianStatus() }));
+}
+
+// POST /jev  and  POST /session/:id/obsidian/search   Body: { message } (or { query })
+// The Jev media agent: plain-English ask → vault rows. Singular asks return
+// exactly one row plus `more`; plural asks return every row.
+async function handleJevQuery(req, res, sessionId = 'jev') {
+  try {
+    const body = await parseBody(req);
+    const message = (body.message || body.query || '').toString().trim();
+    if (!message) {
+      res.writeHead(400, JSON_CORS);
+      res.end(JSON.stringify({ error: 'message is required' }));
+      return;
+    }
+    const result = await obsidianQueryVault(message);
+    console.log(`[${sessionId}] [Jev media] "${message}" → ${result.mode} ${result.rows.length}/${result.total}${result.intent ? ` (brand=${result.intent.brand || '-'} kind=${result.intent.kind} plural=${result.intent.plural} desc=${result.intent.descriptive})` : ''} via ${result.via}, ${result.jev.calls} call(s) ${result.jev.latencyMs}ms ${result.jev.inputTokens} tok`);
+    res.writeHead(200, JSON_CORS);
+    res.end(JSON.stringify({ success: true, ...result }));
+  } catch (error) {
+    console.error(`[${sessionId}] [Jev media] error:`, error);
+    res.writeHead(500, JSON_CORS);
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// POST /session/:id/obsidian/import   Body: { itemIds: string[] }
+// Copies each vault file into the session's assets dir and registers it.
+async function handleObsidianImport(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, JSON_CORS);
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+  try {
+    const { itemIds } = await parseBody(req);
+    if (!Array.isArray(itemIds) || itemIds.length === 0) {
+      res.writeHead(400, JSON_CORS);
+      res.end(JSON.stringify({ error: 'itemIds array is required' }));
+      return;
+    }
+    const { stat, copyFile } = await import('fs/promises');
+    const imported = [];
+    const failed = [];
+
+    for (const itemId of itemIds) {
+      try {
+        const item = obsidianGetItemById(String(itemId));
+        if (!item) { failed.push({ itemId, error: 'Item not found in vault' }); continue; }
+        if (item.type === 'audio') { failed.push({ itemId, error: 'Audio import from the vault is not supported yet' }); continue; }
+
+        const assetId = randomUUID();
+        const ext = (item.file.split('.').pop() || (item.type === 'video' ? 'mp4' : 'png')).toLowerCase();
+        const assetPath = join(session.assetsDir, `${assetId}.${ext}`);
+        await copyFile(item.filePath, assetPath);
+
+        const stats = await stat(assetPath);
+        const isImage = item.type === 'image';
+        let info = { duration: 0, width: item.width, height: item.height };
+        try { info = await getMediaInfo(assetPath); } catch { /* keep frontmatter dims */ }
+
+        const thumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+        let haveThumb = false;
+        if (item.posterPath) {
+          try { await copyFile(item.posterPath, thumbPath); haveThumb = true; } catch { /* fall through */ }
+        }
+        if (!haveThumb) {
+          try { await generateThumbnail(assetPath, thumbPath, isImage); } catch (e) { console.warn(`[${sessionId}] thumb gen failed: ${e.message}`); }
+        }
+
+        const filename = `${item.name}.${ext}`;
+        const asset = {
+          id: assetId,
+          type: item.type,
+          filename,
+          path: assetPath,
+          thumbPath: existsSync(thumbPath) ? thumbPath : null,
+          duration: isImage ? 0 : (info.duration || item.duration || 0),
+          size: stats.size,
+          width: info.width || item.width || 0,
+          height: info.height || item.height || 0,
+          createdAt: Date.now(),
+          obsidianItemId: item.id,
+        };
+        session.assets.set(assetId, asset);
+        imported.push({
+          id: assetId,
+          type: asset.type,
+          filename,
+          duration: asset.duration,
+          size: asset.size,
+          width: asset.width,
+          height: asset.height,
+          thumbnailUrl: asset.thumbPath ? `/session/${sessionId}/assets/${assetId}/thumbnail` : null,
+          streamUrl: `/session/${sessionId}/assets/${assetId}/stream`,
+          obsidianItemId: item.id,
+        });
+        console.log(`[${sessionId}] [Obsidian] Imported "${item.name}" as ${asset.type} asset ${assetId}`);
+      } catch (err) {
+        console.error(`[${sessionId}] [Obsidian] Import failed for ${itemId}:`, err.message);
+        failed.push({ itemId, error: err.message });
+      }
+    }
+
+    if (imported.length > 0) saveAssetMetadata(session);
+    res.writeHead(200, JSON_CORS);
+    res.end(JSON.stringify({ success: true, imported, failed }));
+  } catch (error) {
+    console.error(`[${sessionId}] [Obsidian] Import error:`, error);
+    res.writeHead(500, JSON_CORS);
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// GET /obsidian/thumbnail/:itemId — poster for a clip, or the image itself
+async function handleObsidianThumbnail(req, res, rawId) {
+  try {
+    const item = obsidianGetItemById(decodeURIComponent(rawId));
+    const thumbPath = obsidianThumbnailPathFor(item);
+    if (!thumbPath || !existsSync(thumbPath)) {
+      res.writeHead(404, JSON_CORS);
+      res.end(JSON.stringify({ error: 'Thumbnail not found' }));
+      return;
+    }
+    const ext = thumbPath.split('.').pop().toLowerCase();
+    const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' }[ext] || 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600', 'Access-Control-Allow-Origin': '*' });
+    createReadStream(thumbPath).pipe(res);
+  } catch (error) {
+    console.error('[Obsidian] Thumbnail error:', error);
+    res.writeHead(500, JSON_CORS);
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ============== DIRECTOR: JEV ROUTER + VOICE ==============
+// The Director's "which workflow does this request want?" decision. Jev
+// answers one Choice plus a context Noul in a single fast call; the frontend
+// keeps its keyword router as the fallback when Jev is unconfigured, slow,
+// or unsure.
+
+const DIRECTOR_WORKFLOWS = {
+  'edit-animation': 'Change, adjust or extend an EXISTING AI-generated animation that is open in the edit tab or selected on the timeline: make it bigger, change colors, add a scene, add camera movement or zoom to it, tweak timing.',
+  'create-animation': 'Create a brand-new animated overlay with Remotion: motion graphic, title card, intro or outro, text overlay, infographic, chart or stats, countdown, logo animation, end screen, phone or screen mockup.',
+  'batch-animations': 'Generate several animations spread across the whole video, e.g. "add 5 animations throughout", "animations across the video", "b-roll animations".',
+  'motion-graphics': 'Add a pre-built template graphic: lower third, counter, progress bar, call to action, subscribe button, logo reveal, testimonial card.',
+  'captions': 'Transcribe the speech and add captions or subtitles to the video.',
+  'auto-gif': 'Add GIFs or memes from GIPHY that match what is being said.',
+  'b-roll': 'Add static AI-generated B-roll images that illustrate the speech (not animations).',
+  'dead-air': 'Remove silence, pauses, quiet parts or dead air from the video.',
+  'chapter-cuts': 'Split the video into chapters, sections or topic segments.',
+  'transcript-animation': 'Kinetic typography: animate the spoken words themselves as text on screen.',
+  'contextual-animation': 'An animation that reacts to what is happening in the video during a specific time range the editor has marked.',
+  'extract-audio': 'Separate or extract the audio track from the video onto its own audio track.',
+  'ffmpeg-edit': 'Re-encode the footage itself with FFmpeg: speed up or slow down, reverse, crop, rotate, flip, resize, brightness, contrast, color filter, mute, volume, denoise, fade.',
+  'timeline-op': 'Arrange clips on the timeline without re-encoding: delete or remove a clip, split or cut a clip at a point, move / shift / nudge a clip earlier or later or to another track, trim or shorten or extend a clip\'s start or end, set how long an image stays, make an overlay bigger or smaller, put an overlay in a corner or the center, clear a track, go to / jump to a time, play, pause, stop.',
+  'vault-media': 'Bring a logo, icon, brand mark, profile picture, avatar or b-roll clip from the media vault onto the timeline (e.g. "add the vercel logo", "put the claude logo top right", "drop in the hoops ai clip").',
+};
+
+const TRACK_CRITERIA = {
+  T1: 'T1, the captions / text track',
+  V3: 'V3, the top overlay track (logos, b-roll images)',
+  V2: 'V2, the overlay track (animations)',
+  V1: 'V1, the main / base video track',
+  A1: 'A1, the first audio track',
+  A2: 'A2, the second audio track',
+  none: 'No track is mentioned',
+};
+
+function parseTimelineNumbers(prompt) {
+  const p = prompt.toLowerCase();
+  const out = { seconds: null, time: null, scaleFraction: null };
+  const mmss = p.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (mmss && Number(mmss[2]) < 60) out.time = Number(mmss[1]) * 60 + Number(mmss[2]);
+  const abs = p.match(/\b(?:to|at|until|till)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds?)\b/);
+  if (abs && out.time === null) out.time = Number(abs[1]);
+  const rel = p.match(/\b(?:by|for|of|about)?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds?)\b/);
+  if (rel && !(abs && abs[1] === rel[1] && out.time === Number(rel[1]))) out.seconds = Number(rel[1]);
+  if (/\bhalf a second\b/.test(p)) out.seconds = 0.5;
+  const pct = p.match(/\b(\d{1,3})\s*%/);
+  if (pct) out.scaleFraction = Math.min(1, Math.max(0.02, Number(pct[1]) / 100));
+  const mins = p.match(/\b(\d+(?:\.\d+)?)\s*(?:m|min|mins|minutes?)\b/);
+  if (mins && out.seconds === null && out.time === null) out.seconds = Number(mins[1]) * 60;
+  return out;
+}
+
+function refersToAnimationStrong(p, animationInContext) {
+  return animationInContext && p >= 0.6;
+}
+
+// POST /director/route   Body: { prompt, context }
+async function handleDirectorRoute(req, res) {
+  try {
+    const { prompt, context = {} } = await parseBody(req);
+    if (!prompt || typeof prompt !== 'string') {
+      res.writeHead(400, JSON_CORS);
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+    if (!jevConfigured()) {
+      res.writeHead(200, JSON_CORS);
+      res.end(JSON.stringify({ configured: false }));
+      return;
+    }
+
+    const animationInContext = Boolean(context.editTabHasAnimation || context.selectedClipIsAiAnimation);
+    const state = {
+      request: prompt,
+      editor: {
+        has_video_loaded: Boolean(context.hasVideo),
+        editing_tab_open_with_animation: Boolean(context.isOnEditTab && context.editTabHasAnimation),
+        ai_animation_selected_on_timeline: Boolean(context.selectedClipIsAiAnimation),
+        ai_animations_exist_on_timeline: Boolean(context.hasAiAnimationsOnTimeline),
+        time_range_marked: Boolean(context.hasTimeRange),
+      },
+    };
+    const timelineClips = Array.isArray(context.clips) ? context.clips.slice(0, 60) : [];
+    state.timeline = {
+      playhead_seconds: Number(context.currentTime) || 0,
+      selected_clip: context.selectedClipLabel || null,
+      clips: timelineClips.map((c) => c.label),
+    };
+    const targetCriteria = {
+      selected: 'The currently selected / highlighted clip, or "this clip", "it", "that one" when a clip is selected',
+      at_playhead: 'The clip under the playhead: "here", "at this point", "the current clip"',
+      first: 'The first clip on the track',
+      last: 'The last clip on the track',
+      all_on_track: 'Every clip on one track',
+      everything: 'Every clip on the whole timeline',
+      ...Object.fromEntries(timelineClips.map((c) => [`clip:${c.id}`, `The specific clip "${c.label}"`])),
+      none: 'No particular clip (e.g. playback, seeking, or the request is not about a clip)',
+    };
+    const questions = {
+      workflow: jevChoice(
+        { question: 'Which editor workflow does `request` ask for, given the `editor` state?' },
+        DIRECTOR_WORKFLOWS,
+      ),
+      op: jevChoice(
+        { question: 'If `request` is a timeline arrangement or playback command, which operation is it? Pick none if it is not.' },
+        {
+          delete: 'Delete / remove / get rid of a clip',
+          split: 'Split / cut / divide a clip at a point',
+          move: 'Move / shift / nudge / drag a clip earlier or later, to a time, or onto another track',
+          trim_start: 'Trim / shorten / cut off the beginning of a clip',
+          trim_end: 'Trim / shorten / cut off the end of a clip',
+          extend_start: 'Extend / lengthen the beginning of a clip',
+          extend_end: 'Extend / lengthen the end of a clip, make it last longer',
+          set_duration: 'Set how long an image or overlay stays on screen',
+          scale: 'Make an overlay bigger or smaller, resize it',
+          position: 'Put an overlay in a corner, at the top, bottom or center',
+          seek: 'Go to / jump to / scrub to a time',
+          play: 'Play / resume playback',
+          pause: 'Pause / stop playback',
+          clear_track: 'Clear / empty a whole track',
+          none: 'Not a timeline arrangement or playback command',
+        },
+      ),
+      target: jevChoice({ question: 'Which clip(s) does `request` refer to, given `timeline`?' }, targetCriteria),
+      track: jevChoice({ question: 'Which track does `request` mention as where the clip is or where to look?' }, TRACK_CRITERIA),
+      to_track: jevChoice({ question: 'If `request` moves or places something ONTO a track, which track is the destination?' }, TRACK_CRITERIA),
+      direction: jevChoice(
+        { question: 'If `request` moves or nudges something in time, which way?' },
+        { earlier: 'Earlier / left / back / sooner / towards the start', later: 'Later / right / forward / towards the end', none: 'No direction, or not a move' },
+      ),
+      size: jevChoice(
+        { question: 'If `request` sets the size of an overlay, logo or image, which size?' },
+        { tiny: 'Tiny, a small badge', small: 'Small, a corner logo (default)', half: 'Half the frame, medium', full: 'Full frame, fill the screen', none: 'No size given' },
+      ),
+      position: jevChoice(
+        { question: 'If `request` says where an overlay, logo or image should sit on screen, where?' },
+        { 'top-left': 'Top left corner', 'top-right': 'Top right corner', 'bottom-left': 'Bottom left corner', 'bottom-right': 'Bottom right corner', center: 'Center / middle of the frame', none: 'No position given' },
+      ),
+      refers_to_existing_animation: jevNoul(
+        { question: 'Does `request` refer to the animation the editor already has open or selected (see `editor`), rather than the main footage or something new?' },
+        { true: 'It is about the existing animation ("make it bigger", "change the colors", "add a zoom")', false: 'It is about the main video, or asks for something new' },
+      ),
+    };
+
+    const { answers, latencyMs, model } = await askJev(state, questions);
+    const w = answers.workflow;
+    let workflow = w?.choice;
+    let confidence = Number(w?.confidence ?? 0);
+    const refersToAnimation = Number(answers.refers_to_existing_animation?.noul ?? 0);
+
+    // Deterministic policy on top of the raw judgments.
+    if (animationInContext && refersToAnimation >= 0.6 && ['create-animation', 'motion-graphics', 'contextual-animation'].includes(workflow)) {
+      workflow = 'edit-animation';
+    }
+    if (!DIRECTOR_WORKFLOWS[workflow]) { workflow = null; confidence = 0; }
+
+    const pick = (key, fallback) => (answers[key]?.choice ?? fallback);
+    const numbers = parseTimelineNumbers(prompt);
+    const timelineOp = {
+      operation: pick('op', 'none'),
+      target: pick('target', 'none'),
+      track: pick('track', 'none'),
+      toTrack: pick('to_track', 'none'),
+      direction: pick('direction', 'none'),
+      size: pick('size', 'none'),
+      position: pick('position', 'none'),
+      ...numbers,
+    };
+    // A confident timeline verb overrides a generic bucket: "delete the last clip" is arrangement, not FFmpeg.
+    const opConf = Number(answers.op?.confidence ?? 0);
+    if (timelineOp.operation !== 'none' && opConf >= 0.6 && ['ffmpeg-edit', 'create-animation', 'edit-animation'].includes(workflow) && !refersToAnimationStrong(refersToAnimation, animationInContext)) {
+      workflow = 'timeline-op';
+    }
+
+    console.log(`[Director] Jev route "${prompt.slice(0, 60)}" → ${workflow} (conf ${confidence.toFixed(2)}, anim ${refersToAnimation.toFixed(2)}, op ${timelineOp.operation}/${timelineOp.target}, ${latencyMs}ms)`);
+    res.writeHead(200, JSON_CORS);
+    res.end(JSON.stringify({ configured: true, workflow, confidence, refersToAnimation, probabilities: w?.probabilities || {}, timelineOp, latencyMs, model }));
+  } catch (error) {
+    console.error('[Director] Jev route error:', error.message);
+    res.writeHead(500, JSON_CORS);
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// POST /director/tts   Body: { text, voice? }  → audio/mpeg
+// OpenAI TTS; the client falls back to browser speechSynthesis on any non-200.
+async function handleDirectorTts(req, res) {
+  try {
+    const { text, voice, instructions } = await parseBody(req);
+    if (!text || typeof text !== 'string') {
+      res.writeHead(400, JSON_CORS);
+      res.end(JSON.stringify({ error: 'text is required' }));
+      return;
+    }
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
+    if (!apiKey) {
+      res.writeHead(503, JSON_CORS);
+      res.end(JSON.stringify({ error: 'tts-not-configured' }));
+      return;
+    }
+    const r = await fetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        // gpt-4o-mini-tts follows delivery instructions (accent, age, tone); tts-1 ignores them.
+        model: instructions ? (process.env.DIRECTOR_TTS_INSTRUCTED_MODEL || 'gpt-4o-mini-tts') : (process.env.DIRECTOR_TTS_MODEL || 'tts-1'),
+        voice: voice || process.env.DIRECTOR_TTS_VOICE || 'onyx',
+        input: text.slice(0, 1200),
+        ...(instructions ? { instructions: String(instructions).slice(0, 600) } : {}),
+        response_format: 'mp3',
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.text().catch(() => '');
+      console.error('[Director] TTS error:', r.status, err.slice(0, 200));
+      res.writeHead(502, JSON_CORS);
+      res.end(JSON.stringify({ error: `tts ${r.status}` }));
+      return;
+    }
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': buf.length, 'Access-Control-Allow-Origin': '*' });
+    res.end(buf);
+  } catch (error) {
+    console.error('[Director] TTS error:', error.message);
+    res.writeHead(500, JSON_CORS);
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // ============== SERVER ==============
+
+// ============================================================
+// CreatorOS Agent — publishes rendered timelines to social media via
+// the `creatoros` CLI (wraps @zernio/cli, see node_modules/@creatoros/cli).
+// The API key is supplied by the user through the CreatorOS chat panel and
+// persisted by the CLI itself to ~/.zernio/config.json — this server never
+// stores it, it only forwards it to `creatoros`/`zernio` subprocesses.
+// ============================================================
+const CREATOROS_BIN = join(process.cwd(), 'node_modules', '@creatoros', 'cli', 'dist', 'index.js');
+const CREATOROS_KEY_RE = /^sk_[0-9a-fA-F]{64}$/;
+const CREATOROS_DESTRUCTIVE_RE = /:(delete|cancel)$/;
+
+let creatorOSState = { initialized: false, maskedKey: null, accountSummary: null };
+
+function maskCreatorOSKey(key) {
+  if (!key || key.length < 8) return 'sk_...';
+  return `sk_...${key.slice(-4)}`;
+}
+
+// Run a creatoros/zernio CLI command, capturing output instead of streaming it.
+function runCreatorOS(args, extraEnv = {}) {
+  // Video publishes (posts:create with --media) can take several minutes —
+  // the platform side processes/transcodes before confirming. A short
+  // timeout here kills the CLI process before it sees that confirmation,
+  // even though the post already went through server-side. 10 minutes gives
+  // real headroom without hanging forever on a genuinely stuck command.
+  const result = spawnSync(process.execPath, [CREATOROS_BIN, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, CREATOROS_NO_BANNER: '1', ...extraEnv },
+    cwd: process.cwd(),
+    timeout: 600000,
+  });
+  const timedOut = result.signal != null && result.status == null;
+  return {
+    status: result.status ?? 1,
+    stdout: (result.stdout || '').trim(),
+    stderr: (result.stderr || '').trim(),
+    timedOut,
+  };
+}
+
+function tryParseJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+let creatorOSReferenceDocs = null;
+function loadCreatorOSReferenceDocs() {
+  if (creatorOSReferenceDocs) return creatorOSReferenceDocs;
+  const parts = [];
+  try {
+    parts.push('## Zernio CLI command reference (creatoros wraps this 1:1 — identical flags)\n\n' +
+      readFileSync(join(process.cwd(), 'node_modules', '@zernio', 'cli', 'SKILL.md'), 'utf8'));
+  } catch { /* not installed */ }
+  try {
+    parts.push('## CreatorOS standing rules\n\n' +
+      readFileSync(join(process.cwd(), 'creatoros', 'CLAUDE.md'), 'utf8'));
+  } catch { /* not scaffolded */ }
+  creatorOSReferenceDocs = parts.join('\n\n---\n\n');
+  return creatorOSReferenceDocs;
+}
+
+// Normalize platform names for matching a user's requested platforms against
+// real connected-account platform values — case-insensitive, with "x" as an
+// alias for "twitter" since the CLI/backend still uses the old platform key.
+function normalizeCreatorOSPlatform(platform) {
+  const lower = String(platform || '').trim().toLowerCase();
+  return lower === 'x' ? 'twitter' : lower;
+}
+
+// Substitute {{RENDER_PATH}}, {{MEDIA_URL}}, {{ACCOUNT_IDS}} tokens with real values.
+function substituteCreatorOSTokens(value, context) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/\{\{(RENDER_PATH|MEDIA_URL|ACCOUNT_IDS)\}\}/g, (_, key) => context[key] ?? '');
+}
+
+// Reconnect verification for the "remember me" flow — the CreatorOS panel
+// only ever calls this when its own localStorage flag confirms this browser
+// already completed a real POST /creatoros/init through this chat before.
+// It is NOT used for first-load detection: a fresh browser/user always gets
+// the "what's your API key?" greeting regardless of what this returns.
+// This re-derives from the CLI's own persisted ~/.zernio/config.json so the
+// "connected" state survives this dev server restarting, not just page reloads.
+async function handleCreatorOSStatus(req, res) {
+  if (!creatorOSState.initialized) {
+    const result = runCreatorOS(['accounts:list']);
+    if (result.status === 0) {
+      const parsed = tryParseJson(result.stdout);
+      const list = Array.isArray(parsed) ? parsed : (parsed?.accounts || parsed?.data || []);
+      creatorOSState = {
+        initialized: true,
+        maskedKey: creatorOSState.maskedKey,
+        accountSummary: list.map(a => ({ platform: a.platform || a.type || 'unknown', username: a.username || a.name || a.handle })),
+      };
+    }
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(creatorOSState));
+}
+
+async function handleCreatorOSInit(req, res, sessionId) {
+  try {
+    const body = await parseBody(req);
+    const apiKey = (body.apiKey || '').trim();
+
+    if (!CREATOROS_KEY_RE.test(apiKey)) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: "That doesn't look like a CreatorOS API key (expected sk_ + 64 hex characters). Check the CreatorOS iOS app → Settings → API Key." }));
+      return;
+    }
+
+    console.log(`[${sessionId}] === CREATOR OS: INIT ===`);
+    const check = runCreatorOS(['auth:check'], { CREATOROS_API_KEY: apiKey });
+    if (check.status !== 0) {
+      const parsed = tryParseJson(check.stdout) || tryParseJson(check.stderr);
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `API key was rejected${parsed?.message ? `: ${parsed.message}` : ''}.` }));
+      return;
+    }
+
+    const persist = runCreatorOS(['auth:set', '--key', apiKey]);
+    if (persist.status !== 0) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `Key validated but could not be saved: ${persist.stderr || 'unknown error'}` }));
+      return;
+    }
+
+    const accountsResult = runCreatorOS(['accounts:list']);
+    const parsedAccounts = tryParseJson(accountsResult.stdout);
+    const accountList = Array.isArray(parsedAccounts) ? parsedAccounts
+      : (parsedAccounts?.accounts || parsedAccounts?.data || []);
+    const accountSummary = accountList.map(a => ({
+      platform: a.platform || a.type || 'unknown',
+      username: a.username || a.name || a.handle || undefined,
+    }));
+
+    creatorOSState = {
+      initialized: true,
+      maskedKey: maskCreatorOSKey(apiKey),
+      accountSummary,
+    };
+
+    console.log(`[${sessionId}] CreatorOS initialized — ${accountList.length} account(s) connected`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, maskedKey: creatorOSState.maskedKey, accountSummary }));
+  } catch (error) {
+    console.error(`[${sessionId}] CreatorOS init error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Chat jobs run in the background so the frontend can poll for live,
+// step-by-step progress instead of waiting on one giant response — video
+// publishes can take minutes, so a synchronous request/response would leave
+// the whole chat looking frozen until the very end.
+const creatorOSJobs = new Map();
+
+async function handleCreatorOSChatStart(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  if (!creatorOSState.initialized) {
+    res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'CreatorOS is not connected yet. Paste your API key first.' }));
+    return;
+  }
+
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'ANTHROPIC_API_KEY not configured in .dev.vars — required to plan CreatorOS actions.' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const prompt = (body.prompt || '').trim();
+    if (!prompt) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'prompt is required' }));
+      return;
+    }
+
+    const jobId = randomUUID();
+    creatorOSJobs.set(jobId, { status: 'planning', message: '', steps: [] });
+
+    runCreatorOSChatJob(sessionId, prompt, jobId, anthropicApiKey).catch(err => {
+      const job = creatorOSJobs.get(jobId);
+      if (job) {
+        job.status = 'error';
+        job.error = err.message;
+      }
+      console.error(`[${sessionId}] CreatorOS chat job error:`, err.message);
+    });
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ jobId }));
+  } catch (error) {
+    console.error(`[${sessionId}] CreatorOS chat start error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+function handleCreatorOSChatStatus(req, res, jobId) {
+  const job = creatorOSJobs.get(jobId);
+  if (!job) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Job not found' }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(job));
+  if (job.status === 'complete' || job.status === 'error') {
+    creatorOSJobs.delete(jobId);
+  }
+}
+
+async function runCreatorOSChatJob(sessionId, prompt, jobId, anthropicApiKey) {
+  const job = creatorOSJobs.get(jobId);
+  const session = getSession(sessionId);
+  const logId = sessionId.substring(0, 8);
+  console.log(`\n[${logId}] === CREATOR OS: CHAT ===`);
+  console.log(`[${logId}] Prompt: ${prompt}`);
+
+  const hasClips = (session.project?.clips?.length || 0) > 0;
+  const confirming = /\b(yes|confirm|do it|go ahead|proceed)\b/i.test(prompt);
+
+  const systemPrompt = `You are the planning brain for CreatorOS, a social-media publishing agent embedded inside a video editor called HyperEdit. The user talks to you in natural language; you translate that into a strict JSON execution plan that the app runs for real against their connected social accounts. Get it right — these are real posts.
+
+## Primitive actions you can emit
+
+1. { "action": "render" } — renders the user's current video editor timeline to a final MP4 on disk. Later steps refer to this file as the token {{RENDER_PATH}}. ${hasClips ? 'The timeline currently has clips and can be rendered.' : 'WARNING: the timeline is currently EMPTY — do not emit a render step, tell the user to add a clip first instead.'}
+2. { "action": "cli", "command": "media:upload", "args": ["{{RENDER_PATH}}"] } — uploads a local file, returns a hosted URL captured as {{MEDIA_URL}} for later steps.
+3. { "action": "cli", "command": "accounts:list", "args": [], "platforms": [...] } — lists connected social accounts, captured as {{ACCOUNT_IDS}} for later steps. The optional "platforms" array filters which accounts populate {{ACCOUNT_IDS}} — e.g. ["tiktok","instagram"] to only target those two. Use lowercase platform keys: instagram, tiktok, twitter (also accepts "x"), linkedin, facebook, threads, youtube, bluesky, pinterest, reddit, snapchat, telegram, google-business. Omit "platforms" (or leave it empty) when the user means ALL connected accounts ("post everywhere" / "upload to all socials").
+4. { "action": "cli", "command": "<any other zernio subcommand>", "args": ["--flag", "value", ...] } — passthrough to any other command in the reference docs below (posts:create, posts:list, analytics:posts, accounts:health, inbox:*, etc). args is a flat array of CLI tokens, no shell quoting needed. Use {{RENDER_PATH}}, {{MEDIA_URL}}, {{ACCOUNT_IDS}} tokens where earlier steps produced them.
+
+"Upload to all socials" / "post everywhere" means: render, media:upload, accounts:list (no platforms filter), then posts:create with --accounts {{ACCOUNT_IDS}} and --media {{MEDIA_URL}}. "Upload to TikTok and Instagram" / "just post it to X" means the same chain but with "platforms" set on the accounts:list step to exactly the platforms the user named — never guess or add platforms they didn't ask for. Always include a --text caption — write a short, natural one yourself if the user didn't give one.
+
+## Reference docs
+
+${loadCreatorOSReferenceDocs()}
+
+## Safety
+
+Destructive commands (anything ending in :delete or :cancel, e.g. posts:delete, accounts:delete, profiles:delete, contacts:delete, automations:delete) must NEVER be emitted unless the user's message clearly asks for that specific destructive action. ${confirming ? "The user's latest message contains confirming language (yes/confirm/go ahead) — if their PREVIOUS turn already described a destructive action awaiting confirmation, you may now include it." : ''}
+
+## Output format
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{ "steps": [ ...primitive actions... ], "message": "one short sentence describing what you're about to do, shown to the user before execution" }
+
+If the request is ambiguous, unsafe, or the timeline is empty when a render is needed, return { "steps": [], "message": "<question or explanation for the user>" }.`;
+
+  const raw = (await callClaude(anthropicApiKey, systemPrompt, prompt, 2048)).trim() || '{}';
+  let plan;
+  try {
+    plan = JSON.parse(raw);
+  } catch {
+    job.message = raw;
+    job.status = 'complete';
+    return;
+  }
+
+  job.message = plan.message || '';
+  job.status = 'running';
+
+  const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  const context = {};
+
+  for (const step of steps) {
+    if (step.action === 'render') {
+      const idx = job.steps.push({ label: 'Rendering timeline…', status: 'running' }) - 1;
+      try {
+        const renderRes = await fetch(`http://localhost:${PORT}/session/${sessionId}/render`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ preview: false }),
+        });
+        const renderData = await renderRes.json();
+        if (!renderRes.ok) throw new Error(renderData.error || 'render failed');
+        context.RENDER_PATH = renderData.path;
+        job.steps[idx] = {
+          label: `Rendered timeline (${(renderData.size / 1024 / 1024).toFixed(1)} MB)`,
+          status: 'done',
+        };
+      } catch (err) {
+        job.steps[idx] = { label: `Render failed: ${err.message}`, status: 'error' };
+        break;
+      }
+      continue;
+    }
+
+    if (step.action === 'cli') {
+      const command = String(step.command || '');
+      if (!command) continue;
+
+      if (CREATOROS_DESTRUCTIVE_RE.test(command) && !confirming) {
+        job.steps.push({
+          label: `Skipped "${command}" — destructive action needs explicit confirmation first`,
+          status: 'blocked',
+        });
+        continue;
+      }
+
+      const args = (Array.isArray(step.args) ? step.args : []).map(a => substituteCreatorOSTokens(a, context));
+      const idx = job.steps.push({ label: `creatoros ${command} ${args.join(' ')}`.trim(), status: 'running' }) - 1;
+
+      const cliResult = runCreatorOS([command, ...args]);
+      const parsed = tryParseJson(cliResult.stdout);
+
+      if (cliResult.status !== 0) {
+        const errMsg = cliResult.timedOut
+          ? `timed out waiting for a response after 10 minutes — it may have still succeeded server-side, check "creatoros posts:list" or ask me to check`
+          : (parsed?.message || cliResult.stderr || cliResult.stdout || 'unknown error');
+        job.steps[idx] = { label: `${command} failed: ${errMsg}`, status: 'error' };
+        break;
+      }
+
+      if (command === 'media:upload') {
+        const url = (typeof parsed === 'string' ? parsed : (parsed?.url || parsed?.data?.url || parsed?.mediaUrl));
+        if (url) context.MEDIA_URL = url;
+      }
+      if (command === 'accounts:list') {
+        const list = Array.isArray(parsed) ? parsed : (parsed?.accounts || parsed?.data || []);
+        const requestedPlatforms = Array.isArray(step.platforms) ? step.platforms.filter(Boolean).map(normalizeCreatorOSPlatform) : [];
+        const targetList = requestedPlatforms.length > 0
+          ? list.filter(a => requestedPlatforms.includes(normalizeCreatorOSPlatform(a.platform)))
+          : list;
+        context.ACCOUNT_IDS = targetList.map(a => a._id || a.id).filter(Boolean).join(',');
+
+        if (requestedPlatforms.length > 0 && targetList.length === 0) {
+          const connectedPlatforms = [...new Set(list.map(a => a.platform).filter(Boolean))];
+          job.steps[idx] = {
+            label: `No connected account found for: ${requestedPlatforms.join(', ')}. You have: ${connectedPlatforms.join(', ') || 'none'}.`,
+            status: 'error',
+          };
+          break;
+        }
+        if (requestedPlatforms.length > 0) {
+          const matchedPlatforms = [...new Set(targetList.map(a => a.platform))];
+          const missing = requestedPlatforms.filter(p => !matchedPlatforms.includes(p));
+          job.steps[idx] = {
+            label: missing.length > 0
+              ? `accounts:list done — targeting ${matchedPlatforms.join(', ')} (no connected account for: ${missing.join(', ')})`
+              : `accounts:list done — targeting ${matchedPlatforms.join(', ')}`,
+            status: 'done',
+            output: cliResult.stdout.slice(0, 4000),
+          };
+          continue;
+        }
+      }
+
+      job.steps[idx] = {
+        label: `${command} done`,
+        status: 'done',
+        output: cliResult.stdout.slice(0, 4000),
+      };
+      continue;
+    }
+  }
+
+  job.status = 'complete';
+  console.log(`[${logId}] === CREATOR OS: CHAT COMPLETE (${job.steps.length} step(s)) ===\n`);
+}
+
+// ============================================================================
+// Shorts Generator — find the most viral moments in a long video and cut them
+// into ready-to-post vertical shorts. Built in-house on top of the existing
+// transcription (getOrTranscribeVideo) + FFmpeg helpers. Pipeline:
+//   transcribe → Claude classifies + ranks highlight spans → snap to word
+//   boundaries → dedupe overlaps → top-N → FFmpeg cut + reframe (+ hook
+//   overlay) → register each clip as a session asset with `shortMeta`.
+// Long-running, so it follows the same start/poll job pattern as CreatorOS.
+// ============================================================================
+
+const shortsJobs = new Map();
+
+const SHORTS_RATIOS = {
+  '9:16': { width: 1080, height: 1920 },
+  '4:5': { width: 1080, height: 1350 },
+  '1:1': { width: 1080, height: 1080 },
+  '16:9': { width: 1920, height: 1080 },
+};
+
+const SHORTS_HOOK_FONTS = [
+  '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+  '/System/Library/Fonts/Supplemental/Impact.ttf',
+  '/Library/Fonts/Arial Bold.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+];
+
+function findShortsHookFont() {
+  return SHORTS_HOOK_FONTS.find(p => existsSync(p)) || null;
+}
+
+// Group word timestamps into short timestamped lines so Claude can reason
+// over text but we can still cut by exact time. A new line starts on a pause
+// (> 0.7s) or every ~14 words.
+function formatTranscriptForRanking(words) {
+  const lines = [];
+  let current = [];
+  const flush = () => {
+    if (current.length === 0) return;
+    const start = current[0].start;
+    const end = current[current.length - 1].end;
+    lines.push(`[${start.toFixed(1)}-${end.toFixed(1)}] ${current.map(w => w.text).join(' ')}`);
+    current = [];
+  };
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    const prev = words[i - 1];
+    if (prev && (w.start - prev.end > 0.7 || current.length >= 14)) flush();
+    current.push(w);
+  }
+  flush();
+  return lines.join('\n');
+}
+
+function isSentenceEnd(word) {
+  return /[.!?]["')\]]*$/.test(word.text || '');
+}
+
+// Move a candidate's rough start/end onto real word boundaries, preferring
+// natural sentence breaks within a tolerance window.
+function snapCandidateToWords(candidate, words, totalDuration, minDur, maxDur) {
+  if (!words.length) return candidate;
+  const tol = 2.0;
+
+  let bestStartIdx = -1;
+  let bestStartDist = Infinity;
+  for (let i = 0; i < words.length; i++) {
+    const dist = Math.abs(words[i].start - candidate.start);
+    if (dist > tol) continue;
+    const prev = words[i - 1];
+    const naturalBreak = !prev || isSentenceEnd(prev) || words[i].start - prev.end > 0.4;
+    const weighted = naturalBreak ? dist : dist + 1.5;
+    if (weighted < bestStartDist) { bestStartDist = weighted; bestStartIdx = i; }
+  }
+  if (bestStartIdx === -1) {
+    bestStartIdx = words.findIndex(w => w.start >= candidate.start);
+    if (bestStartIdx === -1) bestStartIdx = 0;
+  }
+
+  let bestEndIdx = -1;
+  let bestEndDist = Infinity;
+  for (let i = bestStartIdx; i < words.length; i++) {
+    const dist = Math.abs(words[i].end - candidate.end);
+    if (words[i].end > candidate.end + tol) break;
+    if (dist > tol) continue;
+    const next = words[i + 1];
+    const naturalBreak = !next || isSentenceEnd(words[i]) || next.start - words[i].end > 0.4;
+    const weighted = naturalBreak ? dist : dist + 1.5;
+    if (weighted < bestEndDist) { bestEndDist = weighted; bestEndIdx = i; }
+  }
+  if (bestEndIdx === -1) {
+    for (let i = words.length - 1; i >= bestStartIdx; i--) {
+      if (words[i].end <= candidate.end) { bestEndIdx = i; break; }
+    }
+    if (bestEndIdx === -1) bestEndIdx = bestStartIdx;
+  }
+
+  let start = Math.max(0, words[bestStartIdx].start - 0.15);
+  let end = Math.min(totalDuration, words[bestEndIdx].end + 0.4);
+
+  // Too long: walk the end back to the last sentence end that fits.
+  if (end - start > maxDur) {
+    let cut = -1;
+    for (let i = bestEndIdx; i > bestStartIdx; i--) {
+      if (words[i].end - start <= maxDur - 0.4 && isSentenceEnd(words[i])) { cut = i; break; }
+    }
+    if (cut === -1) {
+      for (let i = bestEndIdx; i > bestStartIdx; i--) {
+        if (words[i].end - start <= maxDur - 0.4) { cut = i; break; }
+      }
+    }
+    if (cut !== -1) end = Math.min(totalDuration, words[cut].end + 0.4);
+    else end = start + maxDur;
+  }
+
+  return { ...candidate, start, end, duration: end - start, tooShort: end - start < minDur };
+}
+
+function dedupeCandidates(candidates, maxOverlapRatio = 0.25) {
+  const sorted = [...candidates].sort((a, b) => b.score - a.score);
+  const accepted = [];
+  for (const c of sorted) {
+    const clashes = accepted.some(a => {
+      const overlap = Math.min(a.end, c.end) - Math.max(a.start, c.start);
+      if (overlap <= 0) return false;
+      const shorter = Math.min(a.end - a.start, c.end - c.start);
+      return overlap / shorter > maxOverlapRatio;
+    });
+    if (!clashes) accepted.push(c);
+  }
+  return accepted;
+}
+
+async function rankHighlightsWithClaude(apiKey, transcriptLines, totalDuration, opts) {
+  const { count, minDur, maxDur, hook } = opts;
+  const system = `You are an expert short-form video editor who finds the moments in long videos that go viral as TikToks, Reels and Shorts. You are precise about timestamps.
+
+You will receive a transcript where every line is prefixed with its [start-end] time in seconds. Do two things:
+
+1. Classify the video: contentType (one of: podcast, interview, tutorial, lecture, vlog, commentary, storytelling, comedy, news, product-demo, other) and pacing (slow, medium, fast).
+
+2. Find the ${Math.max(count * 3, 8)} strongest self-contained highlight spans. Each must be ${minDur}-${maxDur} seconds long, start at the beginning of a thought and end at a natural stopping point so it makes sense with zero context. Score 0-100 using this virality framework, weighted for the detected content type:
+- Hook strength: the first sentence stops a scroll on its own
+- Emotional peak: laughter, anger, awe, vulnerability
+- Opinion bomb: a strong, contrarian or surprising claim
+- Revelation: a fact, number or reveal the viewer didn't expect
+- Conflict or tension: disagreement, challenge, stakes
+- Quotable: a line people will repeat or screenshot
+- Story peak: the climax or punchline of an anecdote
+- Practical value: a concrete tip the viewer can use today
+Penalise spans that rely on visuals you cannot see, that reference earlier context, or that are rambling.
+
+${hook ? 'For each span also write a "hook": an on-screen title of at most 7 words that makes someone stop scrolling. Curiosity gap, bold claim or direct address. No hashtags, no emoji, no quotation marks.' : 'Set "hook" to an empty string.'}
+
+Return ONLY a JSON object, no prose, no markdown fences:
+{"contentType":"...","pacing":"...","candidates":[{"start":12.3,"end":41.8,"score":88,"title":"3-6 word label","hook":"...","reason":"one sentence"}]}
+Timestamps must be taken from the transcript line prefixes. Total video duration is ${totalDuration.toFixed(1)} seconds.`;
+
+  const text = await callClaude(apiKey, system, `TRANSCRIPT:\n${transcriptLines}`, 6000);
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error(`Claude returned no JSON: ${text.slice(0, 200)}`);
+    parsed = JSON.parse(match[0]);
+  }
+  const candidates = (parsed.candidates || [])
+    .map(c => ({
+      start: Number(c.start),
+      end: Number(c.end),
+      score: Math.max(0, Math.min(100, Math.round(Number(c.score) || 0))),
+      title: String(c.title || '').trim() || 'Highlight',
+      hook: String(c.hook || '').trim().replace(/^["']|["']$/g, ''),
+      reason: String(c.reason || '').trim(),
+    }))
+    .filter(c => Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start);
+  return { contentType: parsed.contentType || 'other', pacing: parsed.pacing || 'medium', candidates };
+}
+
+// Wrap hook text into at most three short lines. Each line is drawn by its
+// own drawtext filter: FFmpeg 8's drawtext renders a missing-glyph box for
+// embedded newlines, so multi-line text can't go through one textfile.
+function wrapHookText(hook, maxChars = 22) {
+  const words = hook.split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if ((cur + ' ' + w).trim().length > maxChars && cur) { lines.push(cur); cur = w; }
+    else cur = (cur + ' ' + w).trim();
+  }
+  if (cur) lines.push(cur);
+  return lines.slice(0, 3);
+}
+
+function buildShortsVideoFilter({ width, height, cropPosition, hookTextFiles = [], fontFile }) {
+  const R = (width / height).toFixed(6);
+  const cropW = `if(gt(iw/ih\\,${R})\\,ih*${R}\\,iw)`;
+  const cropH = `if(gt(iw/ih\\,${R})\\,ih\\,iw/${R})`;
+  const x = cropPosition === 'left' ? '0' : cropPosition === 'right' ? 'iw-ow' : '(iw-ow)/2';
+  const y = '(ih-oh)/2';
+  const filters = [
+    `crop=${cropW}:${cropH}:${x}:${y}`,
+    `scale=${width}:${height}:flags=lanczos`,
+  ];
+  if (fontFile && hookTextFiles.length > 0) {
+    const fontSize = Math.round(height / 22);
+    const lineHeight = Math.round(fontSize * 1.45);
+    const top = Math.round(height * 0.16);
+    hookTextFiles.forEach((file, i) => {
+      filters.push(
+        `drawtext=textfile='${file}':fontfile='${fontFile}'` +
+        `:fontsize=${fontSize}:fontcolor=white` +
+        `:borderw=3:bordercolor=black@0.9:box=1:boxcolor=black@0.45:boxborderw=14` +
+        `:x=(w-text_w)/2:y=${top + i * lineHeight}:enable=lt(t\\,3)`
+      );
+    });
+  }
+  return filters.join(',');
+}
+
+async function handleShortsStart(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'ANTHROPIC_API_KEY not configured in .dev.vars — required to rank highlights.' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const count = Math.max(1, Math.min(8, parseInt(body.count) || 3));
+    const ratio = SHORTS_RATIOS[body.ratio] ? body.ratio : '9:16';
+    const minDur = Math.max(5, Number(body.minDuration) || 20);
+    const maxDur = Math.max(minDur + 5, Number(body.maxDuration) || 60);
+    const hook = body.hook !== false;
+    const cropPosition = ['left', 'center', 'right'].includes(body.cropPosition) ? body.cropPosition : 'center';
+
+    let videoAsset = body.assetId ? session.assets.get(body.assetId) : null;
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated && !asset.shortMeta) { videoAsset = asset; break; }
+      }
+    }
+    if (!videoAsset || videoAsset.type !== 'video') {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No source video found. Upload a video first.' }));
+      return;
+    }
+
+    const jobId = randomUUID();
+    const job = {
+      status: 'running',
+      stage: 'transcribe',
+      message: 'Transcribing…',
+      steps: [{ label: `Transcribe ${videoAsset.filename}`, status: 'running' }],
+      sourceAssetId: videoAsset.id,
+      clips: [],
+    };
+    shortsJobs.set(jobId, job);
+
+    runShortsJob(session, videoAsset, jobId, { count, ratio, minDur, maxDur, hook, cropPosition }, anthropicApiKey)
+      .catch(err => {
+        job.status = 'error';
+        job.error = err.message;
+        const running = job.steps.find(s => s.status === 'running');
+        if (running) running.status = 'error';
+        console.error(`[${sessionId.substring(0, 8)}] Shorts job error:`, err.message);
+      });
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ jobId }));
+  } catch (error) {
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+function handleShortsStatus(req, res, jobId) {
+  const job = shortsJobs.get(jobId);
+  if (!job) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Job not found' }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.end(JSON.stringify(job));
+  if (job.status === 'complete' || job.status === 'error') {
+    // Keep finished jobs around briefly so a poll that races the final write still sees it.
+    setTimeout(() => shortsJobs.delete(jobId), 60_000);
+  }
+}
+
+async function runShortsJob(session, videoAsset, jobId, opts, anthropicApiKey) {
+  const job = shortsJobs.get(jobId);
+  const logId = session.id.substring(0, 8);
+  const { count, ratio, minDur, maxDur, hook, cropPosition } = opts;
+  const { width, height } = SHORTS_RATIOS[ratio];
+  const setStep = (idx, status) => { if (job.steps[idx]) job.steps[idx].status = status; };
+  const pushStep = (label) => job.steps.push({ label, status: 'running' }) - 1;
+
+  console.log(`\n[${logId}] === SHORTS GENERATOR ===`);
+  console.log(`[${logId}] Source: ${videoAsset.filename} | count=${count} ratio=${ratio} ${minDur}-${maxDur}s hook=${hook} crop=${cropPosition}`);
+
+  // 1. Transcribe (cached per asset)
+  const totalDuration = await getVideoDuration(videoAsset.path);
+  const transcript = await getOrTranscribeVideo(session, videoAsset, `${logId}-shorts`);
+  const words = (transcript.words || [])
+    .map(w => ({ text: String(w.text ?? w.word ?? '').trim(), start: Number(w.start), end: Number(w.end) }))
+    .filter(w => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
+  if (words.length < 20) {
+    throw new Error('Not enough speech in this video to find highlights (need a talking video with at least a few sentences).');
+  }
+  setStep(0, 'done');
+  job.steps[0].label = `Transcribed ${words.length} words (${Math.round(totalDuration)}s)`;
+
+  // 2. Classify + rank with Claude
+  job.stage = 'rank';
+  job.message = 'Finding the best moments…';
+  const rankIdx = pushStep('Rank highlights with Claude');
+  const transcriptLines = formatTranscriptForRanking(words);
+  const ranked = await rankHighlightsWithClaude(anthropicApiKey, transcriptLines, totalDuration, { count, minDur, maxDur, hook });
+  job.contentType = ranked.contentType;
+  job.pacing = ranked.pacing;
+  console.log(`[${logId}] Content type: ${ranked.contentType} (${ranked.pacing}) — ${ranked.candidates.length} candidates`);
+  if (ranked.candidates.length === 0) throw new Error('Claude did not return any highlight candidates.');
+  setStep(rankIdx, 'done');
+  job.steps[rankIdx].label = `Ranked ${ranked.candidates.length} candidates (${ranked.contentType}, ${ranked.pacing} pacing)`;
+
+  // 3. Snap to word boundaries, dedupe, take top N
+  const snapped = ranked.candidates
+    .map(c => snapCandidateToWords(c, words, totalDuration, minDur, maxDur))
+    .filter(c => !c.tooShort && c.duration >= 5);
+  const selected = dedupeCandidates(snapped).slice(0, count);
+  if (selected.length === 0) throw new Error('No candidates survived the length constraints. Try a wider duration range.');
+  job.steps.push({ label: `Selected top ${selected.length} after dedupe`, status: 'done' });
+
+  // 4. Cut + reframe each clip
+  job.stage = 'render';
+  const fontFile = hook ? findShortsHookFont() : null;
+  if (hook && !fontFile) console.warn(`[${logId}] No font found for hook overlay — skipping burn-in`);
+
+  for (let i = 0; i < selected.length; i++) {
+    const c = selected[i];
+    job.message = `Cutting short ${i + 1} of ${selected.length}…`;
+    const stepIdx = pushStep(`Cut #${i + 1} "${c.title}" (${c.start.toFixed(1)}s → ${c.end.toFixed(1)}s, score ${c.score})`);
+
+    const assetId = randomUUID();
+    const outPath = join(session.assetsDir, `${assetId}.mp4`);
+    const thumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+    const hookTextFiles = [];
+    if (hook && fontFile && c.hook) {
+      wrapHookText(c.hook).forEach((line, li) => {
+        const file = join(TEMP_DIR, `${assetId}-hook-${li}.txt`);
+        writeFileSync(file, line);
+        hookTextFiles.push(file);
+      });
+    }
+
+    try {
+      await runFFmpeg([
+        '-y',
+        '-ss', c.start.toFixed(3),
+        '-i', videoAsset.path,
+        '-t', c.duration.toFixed(3),
+        '-vf', buildShortsVideoFilter({ width, height, cropPosition, hookTextFiles, fontFile }),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '160k',
+        '-movflags', '+faststart',
+        outPath,
+      ], `${logId}-short${i + 1}`);
+    } finally {
+      for (const f of hookTextFiles) { try { unlinkSync(f); } catch {} }
+    }
+
+    try { await generateThumbnail(outPath, thumbPath); } catch (e) { console.warn(`[${logId}] Thumbnail failed: ${e.message}`); }
+
+    const { stat } = await import('fs/promises');
+    const stats = await stat(outPath);
+    let duration = c.duration;
+    try { duration = await getVideoDuration(outPath); } catch {}
+
+    const slug = c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'highlight';
+    const asset = {
+      id: assetId,
+      type: 'video',
+      filename: `short-${i + 1}-${slug}.mp4`,
+      path: outPath,
+      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+      duration,
+      size: stats.size,
+      width,
+      height,
+      createdAt: Date.now(),
+      aiGenerated: false,
+      sourceAssetId: videoAsset.id,
+      shortMeta: {
+        score: c.score,
+        title: c.title,
+        hook: c.hook,
+        hookBurnedIn: hookTextFiles.length > 0,
+        reason: c.reason,
+        sourceStart: c.start,
+        sourceEnd: c.end,
+        ratio,
+        contentType: ranked.contentType,
+      },
+    };
+    session.assets.set(assetId, asset);
+    saveAssetMetadata(session);
+
+    job.clips.push({
+      id: assetId,
+      filename: asset.filename,
+      duration,
+      width,
+      height,
+      streamUrl: `/session/${session.id}/assets/${assetId}/stream`,
+      thumbnailUrl: asset.thumbPath ? `/session/${session.id}/assets/${assetId}/thumbnail` : null,
+      shortMeta: asset.shortMeta,
+    });
+    setStep(stepIdx, 'done');
+    console.log(`[${logId}] ✓ Short ${i + 1}: ${asset.filename} (${duration.toFixed(1)}s, score ${c.score})`);
+  }
+
+  job.stage = 'done';
+  job.status = 'complete';
+  job.message = `Created ${job.clips.length} short${job.clips.length === 1 ? '' : 's'}`;
+  console.log(`[${logId}] === SHORTS GENERATOR COMPLETE (${job.clips.length} clips) ===\n`);
+}
 
 const server = http.createServer(async (req, res) => {
   // CORS headers
@@ -7671,6 +9319,16 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'process-asset') {
       await handleProcessAsset(req, res, sessionId);
     }
+    // Obsidian agent: config status / search the knowledge base / import from Dropbox
+    else if (req.method === 'GET' && action === 'obsidian/status') {
+      await handleObsidianStatus(req, res);
+    }
+    else if (req.method === 'POST' && action === 'obsidian/search') {
+      await handleJevQuery(req, res, sessionId);
+    }
+    else if (req.method === 'POST' && action === 'obsidian/import') {
+      await handleObsidianImport(req, res, sessionId);
+    }
     // Extract audio from video (creates audio asset + muted video)
     else if (req.method === 'POST' && action === 'extract-audio') {
       await handleExtractAudio(req, res, sessionId);
@@ -7697,6 +9355,26 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'giphy/add') {
       await handleGiphyAdd(req, res, sessionId);
     }
+    // CreatorOS agent endpoints
+    else if (req.method === 'GET' && action === 'creatoros/status') {
+      await handleCreatorOSStatus(req, res);
+    }
+    else if (req.method === 'POST' && action === 'creatoros/init') {
+      await handleCreatorOSInit(req, res, sessionId);
+    }
+    else if (req.method === 'POST' && action === 'creatoros/chat/start') {
+      await handleCreatorOSChatStart(req, res, sessionId);
+    }
+    else if (req.method === 'GET' && action.startsWith('creatoros/chat/status/')) {
+      handleCreatorOSChatStatus(req, res, action.substring('creatoros/chat/status/'.length));
+    }
+    // Shorts generator (transcribe → Claude ranks highlights → FFmpeg cut + reframe)
+    else if (req.method === 'POST' && action === 'shorts/start') {
+      await handleShortsStart(req, res, sessionId);
+    }
+    else if (req.method === 'GET' && action.startsWith('shorts/status/')) {
+      handleShortsStatus(req, res, action.substring('shorts/status/'.length));
+    }
     else if (action.startsWith('renders/')) {
       const renderType = action.substring(8); // Remove 'renders/'
       if (req.method === 'GET') {
@@ -7710,6 +9388,29 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Session endpoint not found' }));
     }
+    return;
+  }
+
+  // Obsidian vault thumbnails (non-session-scoped)
+  const obsidianThumbMatch = path.match(/^\/obsidian\/thumbnail\/(.+)$/);
+  if (obsidianThumbMatch && req.method === 'GET') {
+    await handleObsidianThumbnail(req, res, obsidianThumbMatch[1]);
+    return;
+  }
+
+  // Jev media agent (non-session-scoped): { message } → vault rows
+  if (req.method === 'POST' && path === '/jev') {
+    await handleJevQuery(req, res);
+    return;
+  }
+
+  // Director: Jev workflow routing + voice reply (non-session-scoped)
+  if (req.method === 'POST' && path === '/director/route') {
+    await handleDirectorRoute(req, res);
+    return;
+  }
+  if (req.method === 'POST' && path === '/director/tts') {
+    await handleDirectorTts(req, res);
     return;
   }
 
@@ -7759,5 +9460,24 @@ server.listen(PORT, () => {
   console.log(`   POST /session/:id/analyze-for-animation - Analyze video, return concept for approval`);
   console.log(`   POST /session/:id/generate-contextual-animation - Content-aware animation (transcribes video first)`);
   console.log(`   POST /session/:id/process-asset - Apply FFmpeg command to an asset`);
+  console.log(`\n   Creator OS Agent API:`);
+  console.log(`   GET  /session/:id/creatoros/status - Reconnect check (only used after a prior explicit connect)`);
+  console.log(`   POST /session/:id/creatoros/init - Connect with a CreatorOS API key`);
+  console.log(`   POST /session/:id/creatoros/chat/start - Start a natural-language social publishing job`);
+  console.log(`   GET  /session/:id/creatoros/chat/status/:jobId - Poll live progress of a chat job`);
+  console.log(`\n   Obsidian Agent API:`);
+  console.log(`   GET  /session/:id/obsidian/status - Vault path, item counts, whether Jev is configured`);
+  console.log(`   POST /jev - Jev media agent: { message } in plain English → vault rows (singular = one, plural = all)`);
+  console.log(`   POST /session/:id/obsidian/search - Same as /jev, session-scoped`);
+  console.log(`   POST /session/:id/obsidian/import - Copy matched vault files into the session as assets`);
+  console.log(`   GET  /obsidian/thumbnail/:itemId - Poster / image preview for a vault item`);
+  console.log(`\n   Director Voice + Jev API:`);
+  console.log(`   POST /director/route - Jev picks the Director workflow for a request (falls back client-side)`);
+  console.log(`   POST /director/tts - Spoken reply (OpenAI TTS) for voice mode`);
+  console.log(`\n   Shorts Generator API:`);
+  console.log(`   POST /session/:id/shorts/start - Find viral moments and cut vertical shorts`);
+  console.log(`   GET  /session/:id/shorts/status/:jobId - Poll shorts job progress + results`);
   console.log(`\n   GET /health - Health check\n`);
+  // Warm the Obsidian vault mirror so the first ask doesn't wait on iCloud
+  try { obsidianSyncMirror({ force: true }); console.log('[Obsidian] Mirror sync started'); } catch (e) { console.warn('[Obsidian] Mirror sync failed to start:', e.message); }
 });

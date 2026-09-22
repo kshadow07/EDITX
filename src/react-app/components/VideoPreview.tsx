@@ -89,6 +89,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   selectedLayerId,
 }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const loadedSrcRef = useRef<string | null>(null);
   const overlayVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
   const [draggingLayer, setDraggingLayer] = useState<string | null>(null);
@@ -125,6 +126,23 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     getVideoElement: () => videoRef.current,
   }));
 
+  // Reload video when source URL changes (e.g., after dead air removal)
+  // Using stable key + manual load() preserves the audio permission from user gesture
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !baseLayerUrl) return;
+    if (loadedSrcRef.current !== baseLayerUrl) {
+      if (loadedSrcRef.current) {
+        console.log('[VideoPreview] Source changed, reloading video with audio');
+        console.log('[VideoPreview] Old:', loadedSrcRef.current?.slice(-60));
+        console.log('[VideoPreview] New:', baseLayerUrl.slice(-60));
+      }
+      video.src = baseLayerUrl;
+      video.load();
+      loadedSrcRef.current = baseLayerUrl;
+    }
+  }, [baseLayerUrl]);
+
   // Seek control for base video (only when paused/scrubbing)
   useEffect(() => {
     const video = videoRef.current;
@@ -142,7 +160,10 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     if (!video) return;
 
     if (isPlaying) {
-      video.play().catch(() => {});
+      console.log('[VideoPreview] Playing base video:', { src: video.src?.slice(-60), muted: video.muted, volume: video.volume, readyState: video.readyState, networkState: video.networkState });
+      video.play().catch((err) => {
+        console.error('[VideoPreview] Play failed:', err.name, err.message);
+      });
     } else {
       video.pause();
     }
@@ -239,10 +260,12 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   // Use object-contain to show full video without cropping
   const videoFitClass = 'object-contain';
 
-  // Container classes based on aspect ratio
+  // Container classes based on aspect ratio. Both modes fit the parent
+  // height so the surrounding ResizableVerticalPanel can grow/shrink the
+  // viewer without breaking aspect ratio.
   const containerClass = isVertical
-    ? 'h-[65vh] w-auto aspect-[9/16]'  // Vertical: fixed height, width from aspect ratio
-    : 'w-full max-w-4xl aspect-video';  // Horizontal: constrain width, height follows
+    ? 'h-full max-h-full w-auto aspect-[9/16]'
+    : 'h-full max-h-full w-auto aspect-video';
 
   if (layers.length === 0) {
     return (
@@ -269,7 +292,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       {/* Base video layer (V1) - rendered separately for stability */}
       {foundBaseLayer && (
         <video
-          key={`base-video-${foundBaseLayer.url}`}
+          key="base-video"
           ref={videoRef}
           src={foundBaseLayer.url}
           className={`absolute inset-0 w-full h-full ${videoFitClass}`}
@@ -300,7 +323,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
               }}
               src={layer.url}
               className={`absolute inset-0 w-full h-full ${videoFitClass} cursor-grab active:cursor-grabbing ${
-                isSelected ? 'ring-2 ring-orange-500 ring-offset-2 ring-offset-black' : ''
+                isSelected ? 'ring-2 ring-zinc-500 ring-offset-2 ring-offset-black' : ''
               }`}
               style={styles}
               playsInline
@@ -352,7 +375,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
                 />
                 {/* Selection indicator */}
                 {isSelected && (
-                  <div className="absolute inset-0 ring-2 ring-orange-500 rounded-lg pointer-events-none" />
+                  <div className="absolute inset-0 ring-2 ring-zinc-500 rounded-lg pointer-events-none" />
                 )}
                 {/* Drag handle indicator */}
                 {!isDragging && (
@@ -439,7 +462,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
 
       {/* Dragging indicator */}
       {draggingLayer && (
-        <div className="absolute bottom-3 left-3 text-xs text-orange-400 bg-black/70 px-2 py-1 rounded z-50">
+        <div className="absolute bottom-3 left-3 text-xs text-zinc-400 bg-black/70 px-2 py-1 rounded z-50">
           Dragging...
         </div>
       )}

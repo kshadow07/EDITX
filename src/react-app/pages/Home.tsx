@@ -5,16 +5,19 @@ import AssetLibrary from '@/react-app/components/AssetLibrary';
 import ClipPropertiesPanel from '@/react-app/components/ClipPropertiesPanel';
 import CaptionPropertiesPanel from '@/react-app/components/CaptionPropertiesPanel';
 import AIPromptPanel from '@/react-app/components/AIPromptPanel';
-import PicassoPanel from '@/react-app/components/PicassoPanel';
 import DiCaprioPanel from '@/react-app/components/DiCaprioPanel';
+import CreatorOSPanel from '@/react-app/components/CreatorOSPanel';
+import ShortsPanel from '@/react-app/components/ShortsPanel';
+import ObsidianPanel from '@/react-app/components/ObsidianPanel';
 import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Film, Rocket, Scissors, Database } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
+import { SIZE_TO_SCALE, POSITION_TO_OFFSET, formatTime, type DirectorTimelineOp, type VaultPlacement, type TrackId } from '@/react-app/lib/directorOps';
 
 interface ChapterData {
   chapters: Array<{ start: number; title: string }>;
@@ -33,7 +36,7 @@ export default function Home() {
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
-  const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
+  const [activeAgent, setActiveAgent] = useState<'director' | 'obsidian' | 'dicaprio' | 'creatoros' | 'shorts'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
@@ -62,6 +65,7 @@ export default function Home() {
     loadProject,
     renderProject,
     getDuration,
+    ensureSession,
     // Captions
     addCaptionClipsBatch,
     updateCaptionStyle,
@@ -487,6 +491,26 @@ export default function Home() {
     });
   }, [setSettings]);
 
+  // Shorts generator: drop a finished short onto V1 at the end of the main
+  // timeline, flipping the canvas to match its aspect ratio if needed.
+  const handleAddShortToTimeline = useCallback((assetId: string) => {
+    const asset = assets.find(a => a.id === assetId);
+    if (!asset) return;
+    if (activeTabId !== 'main') switchTimelineTab('main');
+
+    const isPortrait = (asset.height ?? 0) > (asset.width ?? 0);
+    if (asset.width && asset.height) {
+      setSettings(s => ({ ...s, width: asset.width!, height: asset.height! }));
+      setAspectRatio(isPortrait ? '9:16' : '16:9');
+    }
+
+    const v1End = clips
+      .filter(c => c.trackId === 'V1')
+      .reduce((max, c) => Math.max(max, c.start + c.duration), 0);
+    addClip(assetId, 'V1', v1End, asset.duration);
+    setTimeout(() => saveProject(), 100);
+  }, [assets, clips, activeTabId, switchTimelineTab, setSettings, addClip, saveProject]);
+
   // Handle selecting clip
   const handleSelectClip = useCallback((clipId: string | null) => {
     setSelectedClipId(clipId);
@@ -871,21 +895,39 @@ export default function Home() {
       throw new Error('No session available');
     }
 
-    // Check if we have a video asset
-    const videoAsset = assets.find(a => a.type === 'video');
+    // Target the video that is actually on the timeline: the selected V1 clip if
+    // there is one, else the earliest V1 clip. Only fall back to "any video in the
+    // library" when V1 is empty, so an unrelated imported clip is never picked.
+    const v1Clips = clips.filter(c => c.trackId === 'V1').sort((a, b) => a.start - b.start);
+    const targetV1Clip = v1Clips.find(c => c.id === selectedClipId) ?? v1Clips[0] ?? null;
+    const videoAsset = (targetV1Clip && assets.find(a => a.id === targetV1Clip.assetId && a.type === 'video'))
+      || assets.find(a => a.type === 'video' && !a.aiGenerated && !a.shortMeta)
+      || assets.find(a => a.type === 'video');
     if (!videoAsset) {
       throw new Error('Please upload a video first');
     }
 
-    console.log('Removing dead air from video...');
+    // If the audio was extracted to A1 (V1 is muted), send that asset so the
+    // server listens to it and cuts both files with the same segments.
+    const a1Clips = clips.filter(c => c.trackId === 'A1');
+    const linkedA1Clip = a1Clips.find(c => {
+      const a = assets.find(x => x.id === c.assetId);
+      return a?.type === 'audio' && a.sourceAssetId && (a.sourceAssetId === videoAsset.sourceAssetId || a.sourceAssetId === videoAsset.id);
+    }) ?? (targetV1Clip ? a1Clips.find(c => c.start < targetV1Clip.start + targetV1Clip.duration && c.start + c.duration > targetV1Clip.start) : undefined) ?? null;
+    const linkedAudioAsset = linkedA1Clip ? assets.find(a => a.id === linkedA1Clip.assetId && a.type === 'audio') ?? null : null;
+
+    console.log(`Removing dead air from "${videoAsset.filename}" (${targetV1Clip ? 'V1 clip' : 'library fallback'}${linkedAudioAsset ? `, audio on A1: ${linkedAudioAsset.filename}` : ''})...`);
 
     // Call the remove-dead-air endpoint
+    // -26dB catches real pauses, 0.4s avoids cutting natural speech rhythm
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/remove-dead-air`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        silenceThreshold: -30, // dB threshold
-        minSilenceDuration: 0.3, // minimum silence duration in seconds
+        assetId: videoAsset.id, // the clip on V1, not whichever video was uploaded first
+        audioAssetId: linkedAudioAsset?.id, // extracted A1 audio, if any
+        silenceThreshold: -26, // dB threshold
+        minSilenceDuration: 0.4, // minimum silence duration in seconds
       }),
     });
 
@@ -897,26 +939,43 @@ export default function Home() {
     const result = await response.json();
     console.log('Dead air removal result:', result);
 
-    // Refresh assets to get the updated video
-    await refreshAssets();
+    // Refresh assets to get the updated video with new cache-busting URL
+    const refreshedAssets = await refreshAssets();
 
-    // Update the video clip duration if needed
+    // The processed asset keeps its id; re-find it in the refreshed data
+    const assetPool = refreshedAssets.length > 0 ? refreshedAssets : assets;
+    const currentVideoAsset = assetPool.find(a => a.id === videoAsset.id)
+      || assetPool.find(a => a.type === 'video' && !a.aiGenerated && !a.shortMeta)
+      || assetPool.find(a => a.type === 'video');
+
+    // Update the processed V1 clip: fix asset reference + update duration
     if (result.duration) {
-      const v1Clip = clips.find(c => c.trackId === 'V1' && c.assetId === videoAsset.id);
+      const v1Clip = targetV1Clip ?? clips.find(c => c.trackId === 'V1');
       if (v1Clip) {
-        updateClip(v1Clip.id, {
+        const updates: Partial<typeof v1Clip> = {
           duration: result.duration,
           outPoint: result.duration,
-        });
-        await saveProject();
+        };
+        // Also fix asset ID if it's stale (e.g., after server restart)
+        if (currentVideoAsset && v1Clip.assetId !== currentVideoAsset.id) {
+          console.log(`[DeadAir] Fixing stale asset ref: ${v1Clip.assetId} -> ${currentVideoAsset.id}`);
+          updates.assetId = currentVideoAsset.id;
+        }
+        console.log(`[DeadAir] Updating clip ${v1Clip.id}: duration ${v1Clip.duration} -> ${result.duration}`);
+        updateClip(v1Clip.id, updates);
       }
+      // The A1 audio was cut with the same segments; keep its clip in step.
+      if (result.audio && linkedA1Clip) {
+        updateClip(linkedA1Clip.id, { duration: result.audio.duration, outPoint: result.audio.duration, start: v1Clip?.start ?? linkedA1Clip.start });
+      }
+      await saveProject();
     }
 
     return {
       duration: result.duration,
       removedDuration: result.removedDuration,
     };
-  }, [session, assets, clips, refreshAssets, updateClip, saveProject]);
+  }, [session, assets, clips, selectedClipId, refreshAssets, updateClip, saveProject]);
 
   // Handle transcribing video and adding captions
   const handleTranscribeAndAddCaptions = useCallback(async (options?: { highlightColor?: string; fontFamily?: string }) => {
@@ -924,18 +983,33 @@ export default function Home() {
       throw new Error('No session available');
     }
 
-    // Find the video asset to transcribe
-    const videoAsset = assets.find(a => a.type === 'video');
+    // Caption the video that's actually on V1 (the base video track) in the
+    // current timeline. If V1 has multiple clips, pick the longest — that's
+    // the main clip the user is working on.
+    const v1Clips = clips.filter(c => c.trackId === 'V1');
+    if (v1Clips.length === 0) {
+      throw new Error('Add a video to the V1 track before generating captions.');
+    }
+    const mainV1Clip = v1Clips.reduce((a, b) => (a.duration >= b.duration ? a : b));
+    const videoAsset = assets.find(a => a.id === mainV1Clip.assetId);
 
     if (!videoAsset || videoAsset.type !== 'video') {
-      throw new Error('Please upload a video first');
+      throw new Error('The V1 clip does not reference a valid video asset.');
     }
+
+    // If the audio was extracted to A1 (V1 is muted), tell the server which
+    // audio asset carries the speech.
+    const linkedA1 = clips.filter(c => c.trackId === 'A1').find(c => {
+      const a = assets.find(x => x.id === c.assetId);
+      return a?.type === 'audio' && a.sourceAssetId && (a.sourceAssetId === videoAsset.sourceAssetId || a.sourceAssetId === videoAsset.id);
+    }) ?? clips.filter(c => c.trackId === 'A1').find(c => c.start < mainV1Clip.start + mainV1Clip.duration && c.start + c.duration > mainV1Clip.start);
+    const linkedAudioAssetId = linkedA1 ? assets.find(a => a.id === linkedA1.assetId && a.type === 'audio')?.id : undefined;
 
     // Call the transcribe endpoint
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ assetId: videoAsset.id }),
+      body: JSON.stringify({ assetId: videoAsset.id, audioAssetId: linkedAudioAssetId }),
     });
 
     if (!response.ok) {
@@ -1015,7 +1089,7 @@ export default function Home() {
     }
 
     return data;
-  }, [session, assets, addCaptionClipsBatch, saveProject]);
+  }, [session, assets, clips, addCaptionClipsBatch, saveProject]);
 
   // Handle updating caption style
   const handleUpdateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>) => {
@@ -1424,6 +1498,7 @@ export default function Home() {
     return {
       audioAsset: data.audioAsset,
       mutedVideoAsset: data.mutedVideoAsset,
+      warning: data.warning,
       originalAssetId: data.originalAssetId,
     };
   }, [session, clips, assets, refreshAssets, updateClip, addClip, saveProject]);
@@ -1621,16 +1696,222 @@ export default function Home() {
   const isProcessing = loading || legacyProcessing;
   const currentStatus = status || legacyStatus;
 
+  // ===========================================
+  // DIRECTOR: timeline operations + vault media
+  // Jev fills a DirectorTimelineOp on the server; this executes it against
+  // the active timeline (main or edit tab) and returns a one-line result.
+  // ===========================================
+  const clipLabel = useCallback((c: TimelineClip): string => {
+    const a = assets.find(x => x.id === c.assetId);
+    const name = c.trackId === 'T1' ? 'caption' : (a?.filename ?? 'clip');
+    return `${c.trackId} · ${name} · ${formatTime(c.start)}–${formatTime(c.start + c.duration)}`;
+  }, [assets]);
+
+  const resolveDirectorTargets = useCallback((op: DirectorTimelineOp): TimelineClip[] => {
+    const byStart = (list: TimelineClip[]) => [...list].sort((a, b) => a.start - b.start);
+    const track = op.track !== 'none' ? op.track : null;
+    const onTrack = (list: TimelineClip[]) => (track ? list.filter(c => c.trackId === track) : list);
+    const selected = selectedClipId ? activeClips.find(c => c.id === selectedClipId) ?? null : null;
+    const atTime = (t: number) => byStart(activeClips.filter(c => t >= c.start && t < c.start + c.duration));
+    const preferV1 = (list: TimelineClip[]) => (list.some(c => c.trackId === 'V1') ? list.filter(c => c.trackId === 'V1') : list);
+
+    if (op.target.startsWith('clip:')) {
+      const c = activeClips.find(x => x.id === op.target.slice(5));
+      return c ? [c] : [];
+    }
+    switch (op.target) {
+      case 'selected': return selected ? [selected] : [];
+      case 'at_playhead': { const l = onTrack(atTime(currentTime)); return track ? l : preferV1(l).slice(0, 1); }
+      case 'first': { const l = byStart(onTrack(track ? activeClips : activeClips.filter(c => c.trackId === 'V1'))); return l.slice(0, 1); }
+      case 'last': { const l = byStart(onTrack(track ? activeClips : activeClips.filter(c => c.trackId === 'V1'))); return l.slice(-1); }
+      case 'all_on_track': return byStart(activeClips.filter(c => c.trackId === (track ?? 'V1')));
+      case 'everything': return byStart(activeClips);
+      default: {
+        if (selected) return [selected];
+        const l = onTrack(atTime(currentTime));
+        return track ? l.slice(0, 1) : preferV1(l).slice(0, 1);
+      }
+    }
+  }, [activeClips, selectedClipId, currentTime]);
+
+  const executeDirectorTimelineOp = useCallback(async (op: DirectorTimelineOp, prompt: string): Promise<string> => {
+    const lower = prompt.toLowerCase();
+    const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    const secs = op.seconds;
+
+    // Playback / navigation first: no clip needed.
+    if (op.operation === 'play') { setIsPlaying(true); return 'Playing.'; }
+    if (op.operation === 'pause') { setIsPlaying(false); return 'Paused.'; }
+    if (op.operation === 'seek') {
+      let t = op.time;
+      if (t === null && secs !== null) t = op.direction === 'earlier' ? currentTime - secs : currentTime + secs;
+      if (t === null) return 'Tell me where to go, like "go to 0:30" or "skip forward 5 seconds".';
+      const clamped = Math.max(0, Math.min(duration || t, t));
+      handleTimelineSeek(clamped);
+      return `Playhead at ${formatTime(clamped)}.`;
+    }
+    if (op.operation === 'none') {
+      return "I couldn't work out what to do on the timeline. Try \"delete the last clip\", \"split here\", \"move it 2 seconds later\" or \"put the logo top right\".";
+    }
+
+    if (op.operation === 'clear_track') {
+      const track = (op.track !== 'none' ? op.track : op.toTrack !== 'none' ? op.toTrack : null) as TrackId | null;
+      if (!track) return 'Which track should I clear?';
+      const victims = activeClips.filter(c => c.trackId === track);
+      victims.forEach(c => handleDeleteClip(c.id));
+      saveProject();
+      return `Cleared ${track}: removed ${plural(victims.length, 'clip')}.`;
+    }
+
+    if (op.operation === 'split') {
+      if (activeTabId !== 'main') return "Splitting isn't available on edit tabs yet. Switch to the main timeline.";
+      const t = op.time ?? currentTime;
+      let targets = op.target === 'none' || op.target === 'at_playhead'
+        ? activeClips.filter(c => t > c.start && t < c.start + c.duration && (op.track === 'none' || c.trackId === op.track))
+        : resolveDirectorTargets(op).filter(c => t > c.start && t < c.start + c.duration);
+      targets = targets.filter(c => c.trackId !== 'T1');
+      if (targets.length === 0) return `Nothing to split at ${formatTime(t)}.`;
+      let n = 0;
+      for (const c of targets) if (splitClip(c.id, t)) n++;
+      saveProject();
+      return n > 0 ? `Split ${plural(n, 'clip')} at ${formatTime(t)}.` : `Too close to a clip edge to split at ${formatTime(t)}.`;
+    }
+
+    const targets = resolveDirectorTargets(op);
+    if (targets.length === 0) {
+      return selectedClipId || activeClips.length > 0
+        ? "I couldn't tell which clip you mean. Select one, or say \"the last clip on V1\"."
+        : 'The timeline is empty.';
+    }
+    const names = targets.length === 1 ? clipLabel(targets[0]) : plural(targets.length, 'clip');
+
+    switch (op.operation) {
+      case 'delete': {
+        targets.forEach(c => handleDeleteClip(c.id));
+        saveProject();
+        return `Deleted ${names}.`;
+      }
+      case 'move': {
+        const toTrack = op.toTrack !== 'none' ? op.toTrack : null;
+        const delta = secs !== null && op.direction !== 'none' ? (op.direction === 'earlier' ? -secs : secs) : null;
+        if (op.time === null && delta === null && !toTrack) return 'Say how far or where: "move it 2 seconds later", "move it to 0:30", or "move it to V2".';
+        for (const c of targets) {
+          const newStart = op.time !== null ? op.time : delta !== null ? Math.max(0, c.start + delta) : c.start;
+          handleMoveClip(c.id, newStart, toTrack && toTrack !== c.trackId ? toTrack : undefined);
+        }
+        saveProject();
+        const where = op.time !== null ? `to ${formatTime(op.time)}` : delta !== null ? `${Math.abs(delta)}s ${delta < 0 ? 'earlier' : 'later'}` : '';
+        return `Moved ${names}${where ? ' ' + where : ''}${toTrack ? ` onto ${toTrack}` : ''}.`;
+      }
+      case 'trim_start':
+      case 'trim_end':
+      case 'extend_start':
+      case 'extend_end':
+      case 'set_duration': {
+        const amount = op.operation === 'set_duration' ? (secs ?? op.time) : (secs ?? 1);
+        if (amount === null) return 'How long? e.g. "make it 8 seconds".';
+        let changed = 0;
+        for (const c of targets) {
+          const asset = assets.find(a => a.id === c.assetId);
+          const isImage = asset?.type === 'image' || c.trackId === 'T1';
+          const maxOut = isImage ? Number.POSITIVE_INFINITY : (asset?.duration ?? c.outPoint);
+          let inP = c.inPoint, outP = c.outPoint, start = c.start;
+          if (op.operation === 'trim_start') { if (c.duration <= amount + 0.1) continue; inP += amount; start += amount; }
+          else if (op.operation === 'trim_end') { if (c.duration <= amount + 0.1) continue; outP -= amount; }
+          else if (op.operation === 'extend_start') { const room = isImage ? amount : Math.min(amount, c.inPoint); if (room <= 0) continue; inP = isImage ? inP : inP - room; outP = isImage ? outP + room : outP; start = Math.max(0, start - room); }
+          else if (op.operation === 'extend_end') { const newOut = Math.min(maxOut, outP + amount); if (newOut <= outP) continue; outP = newOut; }
+          else { outP = Math.min(maxOut, inP + amount); }
+          handleResizeClip(c.id, inP, outP, start);
+          changed++;
+        }
+        saveProject();
+        if (changed === 0) return `Couldn't ${op.operation.replace('_', ' ')} ${names}: nothing left to give.`;
+        const verb = { trim_start: 'Trimmed the start of', trim_end: 'Trimmed the end of', extend_start: 'Extended the start of', extend_end: 'Extended the end of', set_duration: 'Set the length of' }[op.operation];
+        return `${verb} ${names}${op.operation === 'set_duration' ? ` to ${amount}s` : ` by ${amount}s`}.`;
+      }
+      case 'scale':
+      case 'position': {
+        const overlays = targets.filter(c => c.trackId === 'V2' || c.trackId === 'V3');
+        if (overlays.length === 0) return 'That only applies to overlays on V2 or V3. Select the logo or image first.';
+        for (const c of overlays) {
+          const t = { ...(c.transform ?? {}) };
+          if (op.operation === 'scale') {
+            const current = t.scale ?? 0.2;
+            const next = op.scaleFraction ?? (op.size !== 'none' ? SIZE_TO_SCALE[op.size] : /\b(bigger|larger|huge|big)\b/.test(lower) ? current * 1.5 : /\b(smaller|tiny|small)\b/.test(lower) ? current / 1.5 : null);
+            if (next === null) return 'How big? Say "bigger", "smaller", "half the frame", or a percentage.';
+            t.scale = Math.max(0.02, Math.min(1, next));
+          } else {
+            if (op.position === 'none') return 'Where? Top left, top right, bottom left, bottom right, or center.';
+            const off = POSITION_TO_OFFSET[op.position];
+            t.x = off.x; t.y = off.y;
+          }
+          handleUpdateClipTransform(c.id, t);
+        }
+        return op.operation === 'scale'
+          ? `Resized ${names}.`
+          : `Moved ${names} to the ${op.position.replace('-', ' ')}.`;
+      }
+      default:
+        return "That timeline operation isn't supported yet.";
+    }
+  }, [activeClips, assets, selectedClipId, currentTime, duration, activeTabId, clipLabel, resolveDirectorTargets, handleTimelineSeek, handleDeleteClip, handleMoveClip, handleResizeClip, handleUpdateClipTransform, splitClip, saveProject]);
+
+  // Ask Jev the media agent, import what it returns, and place it on the timeline.
+  const placeVaultMedia = useCallback(async (prompt: string, placement: VaultPlacement): Promise<string> => {
+    const sid = await ensureSession();
+    const searchRes = await fetch(`http://localhost:3333/session/${sid}/obsidian/search`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: prompt }),
+    });
+    const search = await searchRes.json();
+    if (!searchRes.ok || search.error) return `Couldn't reach the vault: ${search.error || searchRes.status}`;
+    const rows: { id: string; name: string; type: string; duration: number }[] = search.rows || [];
+    if (rows.length === 0) {
+      const brand = search.intent?.brand;
+      return brand ? `Nothing on file for ${String(brand).replace(/-/g, ' ')}. I won't swap in another brand's mark.` : 'Nothing in the vault matches that.';
+    }
+    const toImport = search.mode === 'single' ? [rows[0]] : rows.slice(0, 15);
+    const importRes = await fetch(`http://localhost:3333/session/${sid}/obsidian/import`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ itemIds: toImport.map(r => r.id) }),
+    });
+    const imported = await importRes.json();
+    const importedAssets: { id: string; type: 'video' | 'image' | 'audio'; filename: string; duration: number; width: number; height: number }[] = imported.imported || [];
+    if (importedAssets.length === 0) return `Couldn't import: ${imported.failed?.[0]?.error || 'unknown error'}`;
+    await refreshAssets();
+
+    let t = placement.time ?? currentTime;
+    const placed: string[] = [];
+    const v1HasVideo = activeClips.some(c => c.trackId === 'V1');
+    for (const a of importedAssets) {
+      const track: TrackId = placement.track !== 'none' ? placement.track : a.type === 'image' ? 'V3' : a.type === 'audio' ? 'A1' : v1HasVideo ? 'V2' : 'V1';
+      const clipDuration = a.type === 'image' ? 5 : (a.duration || 5);
+      if (activeTabId !== 'main') {
+        handleDropAsset({ id: a.id, type: a.type, filename: a.filename, duration: a.duration, size: 0, thumbnailUrl: null, streamUrl: '' } as Asset, track, t);
+      } else {
+        const clip = addClip(a.id, track, t, clipDuration);
+        if (a.type === 'image') {
+          const scale = placement.size !== 'none' ? SIZE_TO_SCALE[placement.size] : 0.2;
+          const off = placement.position !== 'none' ? POSITION_TO_OFFSET[placement.position] : POSITION_TO_OFFSET['top-right'];
+          updateClip(clip.id, { transform: { scale, x: off.x, y: off.y, opacity: 1 } });
+        }
+      }
+      placed.push(`${a.filename.replace(/\.[^.]+$/, '')} on ${track} at ${formatTime(t)}`);
+      if (importedAssets.length > 1) t += clipDuration;
+    }
+    setTimeout(() => saveProject(), 100);
+    const more = search.mode === 'single' && search.more > 0 ? ` ${search.more} more exist in the vault.` : '';
+    return (placed.length === 1 ? `Placed ${placed[0]}.` : `Placed ${placed.length} files: ${placed.join('; ')}.`) + more;
+  }, [ensureSession, refreshAssets, currentTime, activeClips, activeTabId, handleDropAsset, addClip, updateClip, saveProject]);
+
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-white overflow-hidden">
       {/* Header */}
       <header className="flex items-center justify-between px-6 py-3 bg-zinc-900/50 border-b border-zinc-800/50 backdrop-blur-sm">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-orange-500 to-amber-500 rounded-lg flex items-center justify-center">
+            <div className="w-8 h-8 bg-gradient-to-br from-zinc-500 to-zinc-500 rounded-lg flex items-center justify-center">
               <Sparkles className="w-5 h-5" />
             </div>
-            <h1 className="text-xl font-bold bg-gradient-to-r from-orange-400 to-amber-400 bg-clip-text text-transparent">
+            <h1 className="text-xl font-bold bg-gradient-to-r from-zinc-400 to-zinc-400 bg-clip-text text-transparent">
               HyperEdit
             </h1>
           </div>
@@ -1663,7 +1944,7 @@ export default function Home() {
               )}
             </>
           )}
-          <button className="px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 rounded-lg text-sm font-medium transition-all">
+          <button className="px-4 py-2 bg-gradient-to-r from-zinc-500 to-zinc-500 hover:from-zinc-600 hover:to-zinc-600 rounded-lg text-sm font-medium transition-all">
             AI Edit
           </button>
         </div>
@@ -1690,7 +1971,7 @@ export default function Home() {
           <div className="bg-zinc-900 rounded-xl border border-zinc-700 max-w-lg w-full max-h-[80vh] overflow-hidden flex flex-col">
             <div className="flex items-center justify-between p-4 border-b border-zinc-700">
               <h2 className="text-lg font-semibold flex items-center gap-2">
-                <ListOrdered className="w-5 h-5 text-orange-400" />
+                <ListOrdered className="w-5 h-5 text-zinc-400" />
                 YouTube Chapters
               </h2>
               <button
@@ -1732,7 +2013,7 @@ export default function Home() {
             <div className="p-4 border-t border-zinc-700 flex gap-2">
               <button
                 onClick={handleCopyChapters}
-                className="flex-1 px-4 py-2 bg-orange-600 hover:bg-orange-500 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                className="flex-1 px-4 py-2 bg-zinc-600 hover:bg-zinc-500 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
               >
                 {copied ? (
                   <>
@@ -1804,8 +2085,14 @@ export default function Home() {
 
         {/* Main Editor Area */}
         <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
-          {/* Video Preview */}
-          <div className="flex-1 flex items-center justify-center bg-zinc-900/30 p-4 min-h-0 overflow-hidden">
+          {/* Video Preview — resizable like the timeline */}
+          <ResizableVerticalPanel
+            defaultHeight={Math.round(window.innerHeight * 0.55)}
+            minHeight={220}
+            maxHeight={Math.round(window.innerHeight * 0.85)}
+            position="top"
+            className="flex items-center justify-center bg-zinc-900/30 p-4 overflow-hidden"
+          >
             {hasPreviewContent ? (
               <VideoPreview
                 ref={videoPreviewRef}
@@ -1818,7 +2105,7 @@ export default function Home() {
               />
             ) : clips.length > 0 ? (
               // Assets exist but playhead is not over any clip
-              <div className={`relative ${aspectRatio === '9:16' ? 'h-[65vh] w-auto aspect-[9/16]' : 'w-full max-w-4xl aspect-video'} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
+              <div className={`relative ${aspectRatio === '9:16' ? 'h-full max-h-full w-auto aspect-[9/16]' : 'h-full max-h-full w-auto aspect-video'} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
                 <div className="text-center text-zinc-600">
                   <div className="text-sm">No clip at playhead</div>
                   <div className="text-xs mt-1">Move playhead over a clip to preview</div>
@@ -1831,7 +2118,11 @@ export default function Home() {
                 <p className="text-xs text-zinc-600 mt-1">Drag them to the timeline below</p>
               </div>
             )}
-          </div>
+          </ResizableVerticalPanel>
+
+          {/* Spacer that absorbs any leftover vertical room between the
+              resizable preview and the resizable timeline */}
+          <div className="flex-1 min-h-0 bg-zinc-900/30" />
 
           {/* Timeline - Resizable height */}
           <ResizableVerticalPanel
@@ -1877,40 +2168,62 @@ export default function Home() {
           side="right"
         >
           <div className="h-full flex flex-col bg-zinc-900/80 backdrop-blur-sm">
-            {/* Agent Tabs */}
-            <div className="flex items-center gap-1 px-2 border-b border-zinc-800/50">
+            {/* Agent Tabs — order: Director, Obsidian, DiCaprio, Creator OS, Shorts */}
+            <div className="flex items-center border-b border-zinc-800/50">
               <button
                 onClick={() => setActiveAgent('director')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   activeAgent === 'director'
-                    ? 'text-orange-500 border-b-2 border-orange-500 bg-zinc-800/30'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
                 <Sparkles className="w-3.5 h-3.5" />
-                Director
+                DIRECTOR JEV
               </button>
               <button
-                onClick={() => setActiveAgent('picasso')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
-                  activeAgent === 'picasso'
-                    ? 'text-orange-300 border-b-2 border-orange-300 bg-zinc-800/30'
+                onClick={() => setActiveAgent('obsidian')}
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  activeAgent === 'obsidian'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
-                <Palette className="w-3.5 h-3.5" />
-                Picasso
+                <Database className="w-3.5 h-3.5" />
+                Obsidian / JEV
               </button>
               <button
                 onClick={() => setActiveAgent('dicaprio')}
-                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   activeAgent === 'dicaprio'
-                    ? 'text-zinc-300 border-b-2 border-zinc-300 bg-zinc-800/30'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
                 }`}
               >
                 <Film className="w-3.5 h-3.5" />
                 DiCaprio
+              </button>
+              <button
+                onClick={() => setActiveAgent('creatoros')}
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  activeAgent === 'creatoros'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
+                }`}
+              >
+                <Rocket className="w-3.5 h-3.5" />
+                Creator OS
+              </button>
+              <button
+                onClick={() => setActiveAgent('shorts')}
+                className={`flex-1 flex items-center justify-center gap-1 px-1.5 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  activeAgent === 'shorts'
+                    ? 'text-zinc-200 border-b-2 border-zinc-300 bg-zinc-800/30'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/20'
+                }`}
+              >
+                <Scissors className="w-3.5 h-3.5" />
+                Shorts
               </button>
             </div>
 
@@ -1935,6 +2248,8 @@ export default function Home() {
                   onCreateContextualAnimation={handleCreateContextualAnimation}
                   onOpenAnimationInTab={handleOpenAnimationInTab}
                   onEditAnimation={handleEditAnimation}
+                  onTimelineOp={executeDirectorTimelineOp}
+                  onPlaceVaultMedia={placeVaultMedia}
                   isApplying={isProcessing}
                   applyProgress={0}
                   applyStatus={currentStatus}
@@ -1949,14 +2264,8 @@ export default function Home() {
                   editTabClips={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.clips : undefined}
                 />
               </div>
-              <div className={`absolute inset-0 ${activeAgent === 'picasso' ? '' : 'hidden'}`}>
-                <PicassoPanel
-                  sessionId={session?.sessionId ?? null}
-                  onImageGenerated={(assetId) => {
-                    console.log('Image generated:', assetId);
-                  }}
-                  onRefreshAssets={refreshAssets}
-                />
+              <div className={`absolute inset-0 ${activeAgent === 'obsidian' ? '' : 'hidden'}`}>
+                <ObsidianPanel ensureSession={ensureSession} onRefreshAssets={refreshAssets} />
               </div>
               <div className={`absolute inset-0 ${activeAgent === 'dicaprio' ? '' : 'hidden'}`}>
                 <DiCaprioPanel
@@ -1965,6 +2274,17 @@ export default function Home() {
                   onVideoGenerated={(assetId) => {
                     console.log('Video generated:', assetId);
                   }}
+                  onRefreshAssets={refreshAssets}
+                />
+              </div>
+              <div className={`absolute inset-0 ${activeAgent === 'creatoros' ? '' : 'hidden'}`}>
+                <CreatorOSPanel sessionId={session?.sessionId ?? null} ensureSession={ensureSession} />
+              </div>
+              <div className={`absolute inset-0 ${activeAgent === 'shorts' ? '' : 'hidden'}`}>
+                <ShortsPanel
+                  sessionId={session?.sessionId ?? null}
+                  assets={assets}
+                  onAddToTimeline={handleAddShortToTimeline}
                   onRefreshAssets={refreshAssets}
                 />
               </div>
